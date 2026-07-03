@@ -1,4 +1,4 @@
-# Project Packager
+# Project Packager v2.0.0
 
 A small, safe, audit-friendly Python project packaging CLI.
 
