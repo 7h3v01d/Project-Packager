@@ -1,4 +1,4 @@
-# Project Packager
+# Project Packager v3.0.0
 
 A small, safe, audit-friendly project packaging and release-checking CLI.
 
