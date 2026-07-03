@@ -1,43 +1,41 @@
 #!/usr/bin/env python3
 """
-project_packager.py — v2.0.0
+project_packager.py — v3.0.0
 
-A small, safe, audit-friendly Python project packaging CLI.
+A small, safe, audit-friendly project packaging and release-checking CLI.
 
 Copyright 2026 Leon Priest / 7h3v01d
 Licensed under the Apache License, Version 2.0.
 
-Purpose:
-    Create a clean, verifiable ZIP of a Python project for sharing/uploading.
+Subcommands:
+    package     Create a clean, verifiable ZIP of a project (default).
+    check       Run universal + per-project release sanity checks.
+    verify      Verify a ZIP against its embedded manifest and sidecar hash.
+    init        Write starter release_check.toml and .packagerignore files.
 
-Default behaviour:
-    - Does NOT delete or modify your project.
-    - Excludes common Python/build/editor/cache folders from the ZIP.
-    - Excludes existing *.zip files (no more packages-inside-packages).
-    - Embeds PACKAGE_MANIFEST.json (per-file SHA-256 + sizes) in the ZIP.
-    - Writes a <zip>.sha256 sidecar so recipients can verify the archive.
-    - Scans included text files for likely secrets and warns.
+Backward compatible: `python project_packager.py .` still packages.
 
-Profiles:
-    --profile share     Default. Standard exclusions, secret scan warns.
-    --profile release   Strict + clean + packaging FAILS if secrets found.
-    --profile backup    Keep almost everything (only caches/.git excluded),
-                        no secret scan, no zip exclusion.
+Packaging (see `package --help`):
+    - Never deletes or modifies your project (unless --clean, which removes
+      only disposable cache junk).
+    - Excludes caches, VCS folders, virtualenvs, build output, session
+      debris, and existing *.zip files.
+    - Embeds PACKAGE_MANIFEST.json (per-file SHA-256 + sizes) in the ZIP
+      and writes a sha256sum-compatible <zip>.sha256 sidecar.
+    - Scans included text files for likely secrets; warns by default,
+      blocks in --strict / --profile release.
 
-Optional:
-    --clean             Delete only disposable cache junk before packaging.
-    --dry-run           Show what would happen; write/delete nothing.
-    --strict            Extra privacy exclusions (.env, keys) + secrets block.
-    --exclude PATTERN   Extra exclusion pattern (repeatable, path-aware).
-    --include PATTERN   Force-include pattern (repeatable, beats exclusions).
-    --open              Open the output folder when done.
+Checking (see `check --help`):
+    Built-in universal checks (no config required):
+      - working-tree debris (patch_*/fix_*/add_* scripts, *.bak, *.tmp, ...)
+      - secret scan of tracked text files
+      - latest package inspection: junk entries + manifest hash verification
+    Per-project checks come from release_check.toml (create with `init`):
+      version alignment across files, forbidden strings/regex, required
+      files, required/forbidden file contents, requirements.txt hygiene,
+      and an optional wheel build with required-contents verification.
 
-Per-project config:
-    Drop a `.packagerignore` in the project root. One pattern per line,
-    `#` comments allowed, trailing `/` marks a directory pattern, and any
-    pattern containing `/` is matched against the relative POSIX path.
-
-Standard library only. Windows-friendly (UTF-8 console guard).
+Standard library only. Python 3.11+ (tomllib). Windows-friendly.
 """
 
 from __future__ import annotations
@@ -51,6 +49,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -58,13 +57,31 @@ from pathlib import Path
 from typing import Iterable
 
 TOOL_NAME = "project_packager"
-TOOL_VERSION = "2.0.0"
+TOOL_VERSION = "3.0.0"
 
 MANIFEST_ARCNAME = "PACKAGE_MANIFEST.json"
+CHECK_CONFIG_NAME = "release_check.toml"
+IGNORE_FILE_NAME = ".packagerignore"
 
 # --------------------------------------------------------------------------
 # Exclusion rule data
 # --------------------------------------------------------------------------
+
+# Working-session debris — shared between packager exclusions and checker.
+DEBRIS_FILE_PATTERNS = {
+    "*.bak",
+    "*.bak.*",
+    "*.tmp",
+    "*.old",
+    "*.orig",
+    "patch_*.py",
+    "patch_*.bat",
+    "fix_*.py",
+    "fix_*.bat",
+    "add_*.py",
+    "add_*.bat",
+    "*New Text Document*",
+}
 
 # Directories excluded from ZIP by default (matched by exact name).
 DEFAULT_EXCLUDE_DIR_NAMES = {
@@ -106,22 +123,7 @@ DEFAULT_EXCLUDE_FILE_PATTERNS = {
     "desktop.ini",
     # No packages-inside-packages (rescue with --include "*.zip" if needed)
     "*.zip",
-    # Working-session debris — must never ship
-    "*.bak",
-    "*.bak.*",
-    "*.tmp",
-    "*.old",
-    "*.orig",
-    "patch_*.py",
-    "patch_*.bat",
-    "fix_*.py",
-    "fix_*.bat",
-    "add_*.py",
-    "add_*.bat",
-    "*New Text Document*",
-    # Stale production copies in tests/ (path-aware pattern)
-    "tests/web_app.py",
-}
+} | DEBRIS_FILE_PATTERNS
 
 # Extra privacy/security exclusions only when strict mode is active.
 STRICT_EXCLUDE_DIR_NAMES = {
@@ -171,7 +173,8 @@ CLEAN_FILE_PATTERNS = {
     "*.pyo",
 }
 
-IGNORE_FILE_NAME = ".packagerignore"
+# Directories the checker never descends into.
+CHECK_PRUNE_DIR_NAMES = DEFAULT_EXCLUDE_DIR_NAMES - {"scripts"} | {"packaged"}
 
 # Warn when a single included file exceeds this many bytes.
 LARGE_FILE_WARN_BYTES = 25 * 1024 * 1024
@@ -458,6 +461,20 @@ def scan_project(
     return result
 
 
+def walk_check_tree(project_dir: Path) -> list[Path]:
+    """Yield project files for checking, pruning caches/VCS/venv folders."""
+    found: list[Path] = []
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in CHECK_PRUNE_DIR_NAMES
+            and not matches_any_pattern(d, DEFAULT_EXCLUDE_DIR_PATTERNS)
+        )
+        for file_name in sorted(files):
+            found.append(Path(root) / file_name)
+    return found
+
+
 # --------------------------------------------------------------------------
 # Secret scanning
 # --------------------------------------------------------------------------
@@ -467,22 +484,27 @@ def looks_binary(sample: bytes) -> bool:
     return b"\x00" in sample
 
 
-def scan_for_secrets(project_dir: Path, included_files: list[Path]) -> list[SecretFinding]:
-    """Scan included text files for likely secrets. Read-only, best-effort."""
+def read_text_safe(path: Path, limit: int = SECRET_SCAN_MAX_BYTES) -> str | None:
+    """Read a file as text if it is small and not binary, else None."""
+    try:
+        if path.stat().st_size > limit:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if looks_binary(data[:8192]):
+        return None
+    return data.decode("utf-8", errors="ignore")
+
+
+def scan_for_secrets(project_dir: Path, files: list[Path]) -> list[SecretFinding]:
+    """Scan text files for likely secrets. Read-only, best-effort."""
     findings: list[SecretFinding] = []
 
-    for file_path in included_files:
-        try:
-            if file_path.stat().st_size > SECRET_SCAN_MAX_BYTES:
-                continue
-            data = file_path.read_bytes()
-        except OSError:
+    for file_path in files:
+        text = read_text_safe(file_path)
+        if text is None:
             continue
-
-        if looks_binary(data[:8192]):
-            continue
-
-        text = data.decode("utf-8", errors="ignore")
         rel_path = file_path.relative_to(project_dir)
 
         for label, pattern in SECRET_PATTERNS:
@@ -628,7 +650,452 @@ def create_zip(
 
 
 # --------------------------------------------------------------------------
-# Reporting
+# Archive verification
+# --------------------------------------------------------------------------
+
+
+def verify_archive(zip_path: Path) -> int:
+    """Verify a ZIP against its embedded manifest and .sha256 sidecar.
+
+    Returns 0 if everything checks out, 1 otherwise.
+    """
+    if not zip_path.is_file():
+        print(f"ERROR: not a file: {zip_path}", file=sys.stderr)
+        return 1
+
+    failures = 0
+    print()
+    print(f"Verifying: {zip_path.name}")
+
+    # Sidecar check.
+    sidecar = zip_path.with_name(zip_path.name + ".sha256")
+    if sidecar.is_file():
+        try:
+            expected = sidecar.read_text(encoding="utf-8").split()[0].strip().lower()
+            actual = sha256_of_file(zip_path)
+            if expected == actual:
+                print(f"  OK    sidecar hash matches ({actual[:16]}...)")
+            else:
+                print(f"  FAIL  sidecar hash mismatch")
+                print(f"        expected {expected}")
+                print(f"        actual   {actual}")
+                failures += 1
+        except (OSError, IndexError) as exc:
+            print(f"  WARN  could not read sidecar: {exc}")
+    else:
+        print(f"  WARN  no .sha256 sidecar found")
+
+    # Manifest check.
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            names = set(zf.namelist())
+            if MANIFEST_ARCNAME not in names:
+                print(f"  WARN  no {MANIFEST_ARCNAME} embedded — nothing more to verify")
+                return 1 if failures else 0
+
+            manifest = json.loads(zf.read(MANIFEST_ARCNAME))
+            entries = manifest.get("files", [])
+            print(f"  Manifest: {manifest.get('project', '?')} — "
+                  f"{manifest.get('file_count', len(entries))} file(s), "
+                  f"created {manifest.get('created_utc', '?')}")
+
+            ok_count = 0
+            for entry in entries:
+                arcname = entry.get("path", "")
+                if arcname not in names:
+                    print(f"  FAIL  missing from archive: {arcname}")
+                    failures += 1
+                    continue
+                digest = hashlib.sha256(zf.read(arcname)).hexdigest()
+                if digest != entry.get("sha256"):
+                    print(f"  FAIL  hash mismatch: {arcname}")
+                    failures += 1
+                else:
+                    ok_count += 1
+
+            extras = names - {e.get("path") for e in entries} - {MANIFEST_ARCNAME}
+            extras = {n for n in extras if not n.endswith("/")}
+            for extra in sorted(extras):
+                print(f"  FAIL  not in manifest: {extra}")
+                failures += 1
+
+            print(f"  {ok_count}/{len(entries)} file hashes verified")
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        print(f"  FAIL  could not verify archive: {exc}")
+        failures += 1
+
+    print()
+    if failures:
+        print(f"RESULT: FAIL — {failures} problem(s) found.")
+        return 1
+    print("RESULT: OK — archive verified.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Release checks
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class CheckReport:
+    failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    passed: int = 0
+
+    def check(self, label: str, ok: bool, detail: str = "") -> None:
+        if ok:
+            print(f"  OK    {label}")
+            self.passed += 1
+        else:
+            print(f"  FAIL  {label}" + (f": {detail}" if detail else ""))
+            self.failures.append(label)
+
+    def warn(self, label: str, ok: bool, detail: str = "") -> None:
+        if ok:
+            print(f"  OK    {label}")
+            self.passed += 1
+        else:
+            print(f"  WARN  {label}" + (f": {detail}" if detail else ""))
+            self.warnings.append(label)
+
+    def section(self, name: str) -> None:
+        print(f"\n-- {name} --")
+
+
+def load_check_config(project_dir: Path) -> dict | None:
+    """Load release_check.toml from the project root, or None."""
+    config_path = project_dir / CHECK_CONFIG_NAME
+    if not config_path.is_file():
+        return None
+    try:
+        import tomllib
+    except ImportError:
+        print(
+            f"ERROR: {CHECK_CONFIG_NAME} found but this Python has no tomllib "
+            "(needs Python 3.11+).",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: could not parse {CHECK_CONFIG_NAME}: {exc}", file=sys.stderr)
+        return None
+
+
+def read_project_file(project_dir: Path, rel: str) -> str:
+    """Read one or more '|'-joined project files, concatenated. Missing = ''."""
+    parts = []
+    for piece in rel.split("|"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            parts.append((project_dir / piece).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            parts.append("")
+    return "\n".join(parts)
+
+
+def run_builtin_checks(project_dir: Path, report: CheckReport) -> None:
+    """Universal checks that apply to any project — no config needed."""
+    files = walk_check_tree(project_dir)
+
+    # Working-tree debris.
+    report.section("Working-tree debris")
+    debris = [
+        f for f in files
+        if matches_any_pattern(f.name, DEBRIS_FILE_PATTERNS)
+    ]
+    report.check(
+        "No session debris (patch_*/fix_*/add_*, *.bak, *.tmp, ...)",
+        len(debris) == 0,
+        f"{len(debris)} found: "
+        + ", ".join(normalise_rel(f.relative_to(project_dir)) for f in debris[:5]),
+    )
+    scripts_dir = project_dir / "scripts"
+    report.warn(
+        "No scripts/ working-session folder",
+        not scripts_dir.is_dir(),
+        "scripts/ exists (packager excludes it, but consider deleting)",
+    )
+
+    # Secret scan.
+    report.section("Secret scan")
+    findings = scan_for_secrets(project_dir, files)
+    report.check(
+        "No likely secrets in tracked text files",
+        len(findings) == 0,
+        "; ".join(
+            f"{normalise_rel(f.rel_path)}:{f.line} [{f.label}]" for f in findings[:5]
+        ),
+    )
+
+    # Latest package inspection.
+    report.section("Latest package")
+    candidates = sorted(
+        list((project_dir.parent / "packaged").glob("*.zip"))
+        + list(project_dir.glob("*.zip")),
+        key=lambda z: z.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        report.warn("Release ZIP found", False,
+                    "no *.zip in ../packaged or project root — run `package` first")
+        return
+
+    latest = candidates[0]
+    print(f"  Checking: {latest.name}")
+    try:
+        with zipfile.ZipFile(latest) as zf:
+            names = zf.namelist()
+            junk = [
+                n for n in names
+                if matches_any_pattern(Path(n).name, DEBRIS_FILE_PATTERNS)
+            ]
+            report.check("ZIP contains no debris entries", len(junk) == 0,
+                         ", ".join(junk[:5]))
+            if MANIFEST_ARCNAME in names:
+                manifest = json.loads(zf.read(MANIFEST_ARCNAME))
+                bad = 0
+                for entry in manifest.get("files", []):
+                    arc = entry.get("path", "")
+                    if arc not in names:
+                        bad += 1
+                        continue
+                    if hashlib.sha256(zf.read(arc)).hexdigest() != entry.get("sha256"):
+                        bad += 1
+                report.check(
+                    f"ZIP manifest hashes verify ({len(manifest.get('files', []))} files)",
+                    bad == 0,
+                    f"{bad} mismatch(es)",
+                )
+            else:
+                report.warn("ZIP has embedded manifest", False,
+                            f"no {MANIFEST_ARCNAME} (older package?)")
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        report.check("ZIP is readable", False, str(exc))
+
+
+def run_config_checks(project_dir: Path, config: dict, report: CheckReport) -> None:
+    """Per-project checks driven by release_check.toml."""
+    files = walk_check_tree(project_dir)
+
+    # -- Version alignment --------------------------------------------------
+    version_cfg = config.get("version", {})
+    target = str(version_cfg.get("target", "")).strip()
+    if target:
+        report.section(f"Version identity (target: {target})")
+        for rel in version_cfg.get("files", []):
+            report.check(
+                f"{rel} contains {target}",
+                target in read_project_file(project_dir, rel),
+            )
+
+    # -- Forbidden strings/regex --------------------------------------------
+    forbidden_cfg = config.get("forbidden", {})
+    patterns = forbidden_cfg.get("patterns", {})
+    if patterns:
+        report.section("Forbidden strings")
+        allow_files = set(forbidden_cfg.get("allow_files", [])) | {
+            CHECK_CONFIG_NAME, Path(__file__).name,
+        }
+        compiled: list[tuple[str, re.Pattern[str]]] = []
+        for label, pattern in patterns.items():
+            try:
+                compiled.append((label, re.compile(pattern)))
+            except re.error as exc:
+                report.check(f"forbidden pattern '{label}' compiles", False, str(exc))
+        for label, regex in compiled:
+            hits: list[str] = []
+            for file_path in files:
+                if file_path.name in allow_files:
+                    continue
+                text = read_text_safe(file_path)
+                if text is None:
+                    continue
+                for match in regex.finditer(text):
+                    line = text.count("\n", 0, match.start()) + 1
+                    rel = normalise_rel(file_path.relative_to(project_dir))
+                    hits.append(f"{rel}:{line}")
+                    if len(hits) >= 5:
+                        break
+                if len(hits) >= 5:
+                    break
+            report.check(f"No forbidden '{label}'", len(hits) == 0, ", ".join(hits))
+
+    # -- Required files -----------------------------------------------------
+    required_cfg = config.get("required", {})
+    required_files = required_cfg.get("files", [])
+    if required_files:
+        report.section("Required files")
+        for rel in required_files:
+            report.check(f"{rel} exists", (project_dir / rel).exists())
+
+    # -- Required file contents ----------------------------------------------
+    contains = required_cfg.get("contains", {})
+    if contains:
+        report.section("Required file contents")
+        for rel, needles in contains.items():
+            src = read_project_file(project_dir, rel)
+            for needle in needles:
+                report.check(f"{rel} contains '{needle}'", needle in src)
+
+    # -- Forbidden file contents ----------------------------------------------
+    not_contains = forbidden_cfg.get("contains", {})
+    if not_contains:
+        report.section("Forbidden file contents")
+        for rel, needles in not_contains.items():
+            src = read_project_file(project_dir, rel)
+            for needle in needles:
+                report.check(f"{rel} does not contain '{needle}'", needle not in src)
+
+    # -- Banned paths ----------------------------------------------------------
+    banned = config.get("banned", {}).get("paths", [])
+    if banned:
+        report.section("Banned paths")
+        for rel in banned:
+            clean = rel.rstrip("/")
+            report.check(f"{clean} does not exist", not (project_dir / clean).exists())
+
+    # -- requirements hygiene ---------------------------------------------------
+    req_cfg = config.get("requirements", {})
+    req_forbidden = req_cfg.get("forbidden", [])
+    if req_forbidden:
+        report.section("requirements hygiene")
+        req_file = req_cfg.get("file", "requirements.txt")
+        req_src = read_project_file(project_dir, req_file)
+        heavy = [dep for dep in req_forbidden if dep in req_src]
+        report.check(
+            f"{req_file} has no forbidden deps",
+            len(heavy) == 0,
+            f"move to extras: {heavy}",
+        )
+
+    # -- Wheel build --------------------------------------------------------------
+    wheel_cfg = config.get("wheel", {})
+    if wheel_cfg.get("build", False):
+        report.section("Wheel build")
+        timeout = int(wheel_cfg.get("timeout", 300))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "wheel", ".", "--no-deps",
+                     "-w", tmpdir, "--quiet"],
+                    capture_output=True, text=True, cwd=project_dir, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                report.check("Wheel builds successfully", False,
+                             f"timed out after {timeout}s")
+                return
+            if result.returncode != 0:
+                report.check("Wheel builds successfully", False,
+                             (result.stderr or result.stdout)[:200].strip())
+                return
+            wheels = sorted(Path(tmpdir).glob("*.whl"))
+            if not wheels:
+                report.check("Wheel found after build", False, "no .whl produced")
+                return
+            report.check("Wheel builds successfully", True)
+            with zipfile.ZipFile(wheels[0]) as zf:
+                wheel_names = set(zf.namelist())
+            for member in wheel_cfg.get("must_contain", []):
+                present = member in wheel_names or any(
+                    n.endswith("/" + member) for n in wheel_names
+                )
+                report.check(f"Wheel contains {member}", present)
+
+
+# --------------------------------------------------------------------------
+# Starter config templates (init)
+# --------------------------------------------------------------------------
+
+CHECK_CONFIG_TEMPLATE = """\
+# release_check.toml — per-project rules for `project_packager.py check`.
+# Delete any section you do not need. Built-in checks (debris, secrets,
+# latest-package manifest verification) always run and need no config.
+
+[version]
+# All listed files must contain the target version string.
+target = "1.0.0"
+files = ["pyproject.toml", "CHANGELOG.md"]
+
+[forbidden]
+# Regex patterns that must not appear anywhere in tracked text files.
+# allow_files lists filenames exempt from the scan.
+allow_files = ["CHANGELOG.md"]
+
+[forbidden.patterns]
+"personal IP" = "192\\\\.168\\\\.\\\\d+\\\\.\\\\d+"
+# "legacy brand" = "(?i)old_project_name"
+
+# Per-file substrings that must NOT appear. Key may join several files with |.
+# [forbidden.contains]
+# "main.py" = ["TODO: remove before release"]
+
+[required]
+# Files that must exist before releasing.
+files = ["LICENSE", "README.md"]
+
+# Per-file substrings that MUST appear. Key may join several files with |.
+# [required.contains]
+# "core.py|routes/api.py" = ["validate_request"]
+
+# [banned]
+# Paths that must not exist in the working tree.
+# paths = ["tests/stale_copy.py", "old_stuff/"]
+
+# [requirements]
+# file = "requirements.txt"
+# forbidden = ["heavy-optional-dep"]
+
+# [wheel]
+# build = true
+# timeout = 300
+# must_contain = ["mypackage/__init__.py", "static/app.css"]
+"""
+
+IGNORE_TEMPLATE = """\
+# .packagerignore — extra exclusions for project_packager.py
+# One pattern per line. Trailing / marks a directory. Patterns containing /
+# match against the relative path.
+#
+# docs/
+# *.log
+# data/raw/
+"""
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project).expanduser().resolve()
+    if not project_dir.is_dir():
+        print(f"ERROR: not a directory: {project_dir}", file=sys.stderr)
+        return 2
+
+    wrote = []
+    for name, template in ((CHECK_CONFIG_NAME, CHECK_CONFIG_TEMPLATE),
+                           (IGNORE_FILE_NAME, IGNORE_TEMPLATE)):
+        target = project_dir / name
+        if target.exists():
+            print(f"SKIP  {name} already exists")
+            continue
+        try:
+            target.write_text(template, encoding="utf-8")
+            wrote.append(name)
+            print(f"WROTE {name}")
+        except OSError as exc:
+            print(f"ERROR: could not write {name}: {exc}", file=sys.stderr)
+            return 4
+
+    if wrote:
+        print(f"\nEdit {', '.join(wrote)} to fit this project, then run:")
+        print(f"  python {Path(sys.argv[0]).name} check {project_dir}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Reporting (packager)
 # --------------------------------------------------------------------------
 
 
@@ -765,126 +1232,75 @@ def open_folder(path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# CLI
+# Subcommand: check
 # --------------------------------------------------------------------------
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Create a clean, verifiable ZIP of a Python project for sharing.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "project",
-        nargs="?",
-        default=".",
-        help="Project directory to package.",
-    )
-    parser.add_argument(
-        "--profile",
-        choices=("share", "release", "backup"),
-        default="share",
-        help="Packaging profile: share (default), release (strict+clean, "
-        "fails on secrets), backup (keep almost everything).",
-    )
-    parser.add_argument(
-        "--output",
-        "-o",
-        default=None,
-        help="Output folder for the ZIP. Defaults to ./packaged beside the project.",
-    )
-    parser.add_argument(
-        "--name",
-        "-n",
-        default=None,
-        help="Custom base name for the ZIP. Timestamp is still appended.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Show what would be included/excluded without creating a ZIP.",
-    )
-    parser.add_argument(
-        "--clean",
-        action="store_true",
-        help="Delete only safe cache junk before packaging.",
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="Extra privacy exclusions (.env, keys) and secrets block packaging.",
-    )
-    parser.add_argument(
-        "--exclude",
-        action="append",
-        default=[],
-        metavar="PATTERN",
-        help="Extra exclusion pattern (repeatable; patterns with '/' match paths).",
-    )
-    parser.add_argument(
-        "--include",
-        action="append",
-        default=[],
-        metavar="PATTERN",
-        help="Force-include pattern (repeatable; overrides all exclusions).",
-    )
-    parser.add_argument(
-        "--no-scan",
-        action="store_true",
-        help="Disable the secret scanner.",
-    )
-    parser.add_argument(
-        "--no-manifest",
-        action="store_true",
-        help="Do not embed PACKAGE_MANIFEST.json in the ZIP.",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Package anyway even if strict/release mode finds secrets.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Allow overwriting an existing ZIP with the same name.",
-    )
-    parser.add_argument(
-        "--open",
-        action="store_true",
-        help="Open the output folder when packaging completes.",
-    )
-    parser.add_argument(
-        "--list-included",
-        action="store_true",
-        help="Print every included file.",
-    )
-    parser.add_argument(
-        "--list-excluded",
-        action="store_true",
-        help="Print every excluded item.",
-    )
-    return parser.parse_args(argv)
+def run_all_checks(project_dir: Path) -> CheckReport:
+    report = CheckReport()
+    config = load_check_config(project_dir)
+
+    print()
+    print("=" * 72)
+    header = f"Release checks — {project_dir.name}"
+    if config and str(config.get("version", {}).get("target", "")).strip():
+        header += f" (target: {config['version']['target']})"
+    print(header)
+    print("=" * 72)
+
+    run_builtin_checks(project_dir, report)
+    if config:
+        run_config_checks(project_dir, config, report)
+    else:
+        print(f"\n(No {CHECK_CONFIG_NAME} — built-in checks only. "
+              f"Run `init` to create one.)")
+
+    print()
+    if report.failures:
+        print(f"RESULT: FAIL — {len(report.failures)} failed, "
+              f"{len(report.warnings)} warning(s), {report.passed} passed.")
+    else:
+        print(f"RESULT: OK — all checks passed "
+              f"({report.passed} passed, {len(report.warnings)} warning(s)).")
+    print()
+    return report
 
 
-def main(argv: list[str] | None = None) -> int:
-    # Guard against cp1252 console crashes on Windows.
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
-        except (AttributeError, OSError):
-            pass
+def cmd_check(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project).expanduser().resolve()
+    if not project_dir.is_dir():
+        print(f"ERROR: not a directory: {project_dir}", file=sys.stderr)
+        return 2
+    report = run_all_checks(project_dir)
+    return 1 if report.failures else 0
 
-    args = parse_args(argv if argv is not None else sys.argv[1:])
 
+# --------------------------------------------------------------------------
+# Subcommand: verify
+# --------------------------------------------------------------------------
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    return verify_archive(Path(args.zip).expanduser().resolve())
+
+
+# --------------------------------------------------------------------------
+# Subcommand: package
+# --------------------------------------------------------------------------
+
+
+def cmd_package(args: argparse.Namespace) -> int:
     # Apply profile presets.
     strict = args.strict
     clean = args.clean
     scan_secrets = not args.no_scan
     fail_on_secrets = args.strict
+    run_checks_first = args.check
     if args.profile == "release":
         strict = True
         clean = True
         fail_on_secrets = True
+        run_checks_first = True
     elif args.profile == "backup":
         scan_secrets = False
         fail_on_secrets = False
@@ -896,6 +1312,16 @@ def main(argv: list[str] | None = None) -> int:
     if not project_dir.is_dir():
         print(f"ERROR: project path is not a directory: {project_dir}", file=sys.stderr)
         return 2
+
+    if run_checks_first:
+        report = run_all_checks(project_dir)
+        if report.failures and not args.force:
+            print(
+                "ERROR: release checks failed — not packaging.\n"
+                "Fix the failures or re-run with --force.",
+                file=sys.stderr,
+            )
+            return 6
 
     if args.output:
         output_dir = Path(args.output).expanduser().resolve()
@@ -1000,6 +1426,115 @@ def main(argv: list[str] | None = None) -> int:
         open_folder(output_dir)
 
     return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+KNOWN_COMMANDS = {"package", "check", "verify", "init"}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=TOOL_NAME,
+        description="Package, check, and verify project releases.",
+    )
+    parser.add_argument("--version", action="version",
+                        version=f"{TOOL_NAME} {TOOL_VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # -- package --------------------------------------------------------------
+    p = sub.add_parser(
+        "package",
+        help="Create a clean, verifiable ZIP of a project (default command).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("project", nargs="?", default=".",
+                   help="Project directory to package.")
+    p.add_argument("--profile", choices=("share", "release", "backup"),
+                   default="share",
+                   help="share (default), release (strict+clean+checks, fails "
+                        "on secrets), backup (keep almost everything).")
+    p.add_argument("--output", "-o", default=None,
+                   help="Output folder. Defaults to ./packaged beside the project.")
+    p.add_argument("--name", "-n", default=None,
+                   help="Custom ZIP base name. Timestamp is still appended.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show what would happen; write and delete nothing.")
+    p.add_argument("--clean", action="store_true",
+                   help="Delete only safe cache junk before packaging.")
+    p.add_argument("--strict", action="store_true",
+                   help="Extra privacy exclusions; secrets block packaging.")
+    p.add_argument("--check", action="store_true",
+                   help="Run release checks first; abort if any fail.")
+    p.add_argument("--exclude", action="append", default=[], metavar="PATTERN",
+                   help="Extra exclusion (repeatable; '/' in pattern = path match).")
+    p.add_argument("--include", action="append", default=[], metavar="PATTERN",
+                   help="Force-include (repeatable; overrides all exclusions).")
+    p.add_argument("--no-scan", action="store_true",
+                   help="Disable the secret scanner.")
+    p.add_argument("--no-manifest", action="store_true",
+                   help="Do not embed PACKAGE_MANIFEST.json in the ZIP.")
+    p.add_argument("--force", action="store_true",
+                   help="Package anyway despite secret findings or failed checks.")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Allow overwriting an existing ZIP of the same name.")
+    p.add_argument("--open", action="store_true",
+                   help="Open the output folder when done.")
+    p.add_argument("--list-included", action="store_true",
+                   help="Print every included file.")
+    p.add_argument("--list-excluded", action="store_true",
+                   help="Print every excluded item with its reason.")
+    p.set_defaults(func=cmd_package)
+
+    # -- check --------------------------------------------------------------
+    c = sub.add_parser(
+        "check",
+        help="Run universal + per-project release checks (release_check.toml).",
+    )
+    c.add_argument("project", nargs="?", default=".",
+                   help="Project directory to check.")
+    c.set_defaults(func=cmd_check)
+
+    # -- verify --------------------------------------------------------------
+    v = sub.add_parser(
+        "verify",
+        help="Verify a ZIP against its embedded manifest and .sha256 sidecar.",
+    )
+    v.add_argument("zip", help="Path to the ZIP to verify.")
+    v.set_defaults(func=cmd_verify)
+
+    # -- init --------------------------------------------------------------
+    i = sub.add_parser(
+        "init",
+        help="Write starter release_check.toml and .packagerignore files.",
+    )
+    i.add_argument("project", nargs="?", default=".",
+                   help="Project directory to initialise.")
+    i.set_defaults(func=cmd_init)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Guard against cp1252 console crashes on Windows.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, OSError):
+            pass
+
+    raw = list(argv) if argv is not None else sys.argv[1:]
+
+    # Backward compatibility: `project_packager.py .` still packages.
+    if raw and raw[0] not in KNOWN_COMMANDS and not raw[0].startswith("-"):
+        raw = ["package"] + raw
+    elif not raw:
+        raw = ["package"]
+
+    args = build_parser().parse_args(raw)
+    return args.func(args)
 
 
 if __name__ == "__main__":

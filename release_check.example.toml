@@ -1,0 +1,109 @@
+# release_check.example.toml
+#
+# Example: a fully-loaded per-project config for `project_packager.py check`,
+# showing how a hardcoded project-specific release checker translates into
+# declarative rules. Copy to your project root as `release_check.toml`
+# and adapt. Delete any section you don't need.
+#
+# Built-in checks always run without any config:
+#   - working-tree debris (patch_*/fix_*/add_* scripts, *.bak, *.tmp, ...)
+#   - secret scan (AWS/Anthropic/OpenAI/GitHub/Slack/Google keys, key blocks)
+#   - latest package inspection (junk entries + manifest hash verification)
+
+# ---------------------------------------------------------------------------
+# Version alignment: every listed file must contain the target string.
+# Use this for config banners, FastAPI app versions, pyproject, changelog.
+# ---------------------------------------------------------------------------
+[version]
+target = "3.2.2"
+files = [
+    "config.py",
+    "app.py",
+    "web_app.py",
+    "pyproject.toml",
+    "CHANGELOG.md",
+]
+
+# ---------------------------------------------------------------------------
+# Forbidden strings: regex patterns that must not appear in any tracked
+# text file. Use for personal IPs, legacy branding, internal hostnames.
+# allow_files exempts specific filenames (the checker config and the tool
+# itself are always exempt).
+# ---------------------------------------------------------------------------
+[forbidden]
+allow_files = ["CHANGELOG.md"]
+
+[forbidden.patterns]
+"personal LAN IP"   = "192\\.168\\.\\d{1,3}\\.\\d{1,3}"
+"legacy brand name" = "(?i)old_brand_name"
+
+# Per-file substrings that must NOT appear.
+# A key may join several files with | (contents are concatenated).
+[forbidden.contains]
+"app.py"   = ["My Project v2"]                                  # stale banner
+"tools.py" = ["str(target).startswith(str(base))"]             # weak sandbox
+
+# ---------------------------------------------------------------------------
+# Required files: must exist before releasing.
+# ---------------------------------------------------------------------------
+[required]
+files = [
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "RELEASE_CHECKLIST.md",
+    "pyproject.toml",
+]
+
+# Per-file substrings that MUST appear. Join alternatives with |,
+# e.g. after a refactor moved a pipeline across files.
+[required.contains]
+"tool_repair.py"                                = ["prepare_tool_calls", "dispatch_prepared"]
+"web_app.py|routes/chat.py|governed_executor.py" = ["prepare_tool_calls", "dispatch_prepared"]
+"tools.py"                                      = ["_safe_path", "relative_to"]
+"web_app.py"                                    = ["APP_AUTH_TOKEN"]
+"config.py"                                     = ["use_remote: bool = False"]
+
+# ---------------------------------------------------------------------------
+# Banned paths: must not exist in the working tree.
+# ---------------------------------------------------------------------------
+[banned]
+paths = [
+    "tests/web_app.py",       # stale production snapshot
+    "plugins/python_repl.zip" # unsafe in-process REPL
+]
+
+# ---------------------------------------------------------------------------
+# requirements.txt hygiene: heavy optional deps that belong in extras.
+# ---------------------------------------------------------------------------
+[requirements]
+file = "requirements.txt"
+forbidden = [
+    "faster-whisper",
+    "sounddevice",
+    "webrtcvad",
+    "nvidia-ml-py3",
+    "pdfplumber",
+    "pypdf",
+    "hnswlib",
+    "pytesseract",
+    "piper-tts",
+]
+
+# ---------------------------------------------------------------------------
+# Wheel build: actually builds the wheel (pip wheel . --no-deps) and checks
+# that critical modules and browser assets survive the packaging.
+# ---------------------------------------------------------------------------
+[wheel]
+build = true
+timeout = 300
+must_contain = [
+    "app.py",
+    "web_app.py",
+    "config.py",
+    "tools.py",
+    "static/app.css",
+    "static/js/core.js",
+    "example_plugins/system_monitor/plugin.json",
+]
