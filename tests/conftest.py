@@ -100,8 +100,31 @@ def symlinks_available(tmp_path: Path) -> bool:
 
 @pytest.fixture()
 def needs_symlinks(tmp_path: Path) -> None:
-    if not symlinks_available(tmp_path):
-        pytest.skip("symlink creation is not permitted on this platform/account")
+    """Skip locally when symlinks are unavailable; fail where they're required.
+
+    These tests cover the highest-priority defect in the original report — a
+    symlink smuggling material from outside the project into the archive — so
+    a run where they quietly skip is materially weaker than it looks. Setting
+    PP_REQUIRE_SYMLINKS=1 turns the skip into a failure, which is how CI finds
+    out whether a platform really grants the privilege rather than assuming it.
+
+    On Windows, symlink creation needs Developer Mode (Settings → System → For
+    developers) or an elevated shell.
+    """
+    if symlinks_available(tmp_path):
+        return
+
+    message = (
+        "symlink creation is not permitted on this platform/account — "
+        "the symlink containment tests did not run"
+    )
+    if os.environ.get("PP_REQUIRE_SYMLINKS") == "1":
+        pytest.fail(
+            f"{message}. PP_REQUIRE_SYMLINKS=1 is set, so this is a failure "
+            "rather than a skip: enable Developer Mode, or unset the variable "
+            "if this platform genuinely cannot support it."
+        )
+    pytest.skip(message)
 
 
 # --------------------------------------------------------------------------

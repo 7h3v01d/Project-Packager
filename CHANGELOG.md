@@ -4,7 +4,24 @@ All notable changes to Project Packager are recorded here.
 
 ## 3.0.1 — Safety hotfix
 
+### Test-infrastructure corrections
+
+- **Symlink coverage can now be required rather than hoped for.**
+  `PP_REQUIRE_SYMLINKS=1` turns the skip into a failure, and CI sets it. The
+  workflow previously ran `git config core.symlinks true` and claimed this made
+  the containment tests execute on Windows runners; that setting affects git
+  checkout, not `os.symlink`, so it did nothing and the claim was unverified.
+  CI now probes the privilege explicitly and reports it.
+
 ### Corrections following external review of 3.0.1-rc5
+
+- **Two unsafe-member tests were passing on Windows for the wrong reason.**
+  `ZipInfo.__init__` rewrites `os.sep` to `/`, so backslash and UNC member names
+  were normalised before being written; the rewritten member then failed to
+  match its manifest entry and verification failed as "missing from archive",
+  not because any unsafe-path guard exists. Strict xfail surfaced this as an
+  XPASS on Windows. The hostile name is now written verbatim and the test
+  asserts the guard is named, so it means the same thing on every platform.
 
 - **Binary detection uses control-byte density, not NUL presence.** A single
   NUL in an otherwise printable file was enough to label it "binary content —

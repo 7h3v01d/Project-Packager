@@ -109,6 +109,28 @@ an implementation detail changed:
 Where the report asks for a specific guard, the test asserts the tool named that
 guard (`assert_failure_line`), not merely that something went wrong.
 
+**Symlink coverage is opt-in strict.** Eight tests need `os.symlink`, which on
+Windows requires Developer Mode (Settings → System → For developers) or an
+elevated shell. Without it they skip, and since they cover the original
+report's highest-priority defect — a symlink smuggling material from outside
+the project into the archive — a green run that skipped them is weaker than it
+looks. Set `PP_REQUIRE_SYMLINKS=1` to turn the skip into a failure; CI does
+this so the privilege is verified rather than assumed.
+
+```bash
+PP_REQUIRE_SYMLINKS=1 pytest    # fails if containment tests cannot run
+```
+
+**Platform-dependent XPASS is a real failure mode.** Two of the unsafe-member
+cases used to pass on Windows and fail on Linux, for a reason unrelated to
+safety: `ZipInfo.__init__` rewrites `os.sep` to `/`, so a backslash member name
+was silently normalised, no longer matched its manifest entry, and verification
+failed as "missing from archive". Strict xfail turned that accidental pass into
+a CI failure on Windows only — which is exactly what it is for. The fix was to
+write the member name verbatim and assert the guard is named, so the test means
+the same thing on every platform. If an xfail passes on one OS and not another,
+suspect the test before celebrating the fix.
+
 **The suite survives the v3.1.0 restructure.** `conftest.py` imports
 `project_packager` from `src/` if that directory exists and falls back to the
 single-file module otherwise, so the same tests can run against both forms — which

@@ -142,6 +142,24 @@ def test_duplicate_member_fails(demo_project: Path, out_dir: Path, capsys) -> No
 
 @pytest.mark.defect
 @pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
+def write_member_verbatim(zf, name: str, data: bytes) -> None:
+    """Write a member under exactly this name, bypassing normalisation.
+
+    ZipInfo.__init__ replaces os.sep with "/", so on Windows a backslash name
+    silently becomes a forward-slash one. That normalisation is what made two
+    of these cases pass on Windows — the rewritten member no longer matched the
+    manifest entry, so verification failed as "missing from archive" rather
+    than because any unsafe-path guard existed. Setting filename afterwards
+    puts the hostile name in the archive on every platform.
+    """
+    info = zipfile.ZipInfo("placeholder")
+    info.filename = name
+    info.compress_type = zipfile.ZIP_DEFLATED
+    zf.writestr(info, data)
+
+
+@pytest.mark.defect
+@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 @pytest.mark.parametrize(
     "hostile_name",
     [
@@ -153,12 +171,23 @@ def test_duplicate_member_fails(demo_project: Path, out_dir: Path, capsys) -> No
         "\\\\server\\share\\evil.dll",
     ],
 )
-def test_unsafe_member_paths_fail(demo_project: Path, out_dir: Path, hostile_name: str) -> None:
+def test_unsafe_member_paths_fail(
+    demo_project: Path, out_dir: Path, hostile_name: str, capsys
+) -> None:
     """Absolute, drive-qualified, UNC, and traversal names must be rejected
-    whether or not they appear in the manifest."""
+    whether or not they appear in the manifest.
+
+    The manifest lists the hostile name too, so the archive is internally
+    consistent: the only thing that can fail it is a guard that objects to the
+    name itself. Asserting the stated reason keeps this honest across
+    platforms — otherwise Windows path normalisation makes two of these cases
+    pass for reasons unrelated to safety.
+    """
     zip_path = build_package(demo_project, out_dir)
     manifest = load_manifest(zip_path)
-    manifest["files"].append({"path": hostile_name, "size": 3, "sha256": pkg.hashlib.sha256(b"bad").hexdigest()})
+    manifest["files"].append(
+        {"path": hostile_name, "size": 3, "sha256": pkg.hashlib.sha256(b"bad").hexdigest()}
+    )
     manifest["file_count"] = len(manifest["files"])
 
     def mutate(zf, payload):
@@ -166,10 +195,11 @@ def test_unsafe_member_paths_fail(demo_project: Path, out_dir: Path, hostile_nam
             if item.filename == pkg.MANIFEST_ARCNAME:
                 data = json.dumps(manifest, indent=2).encode("utf-8")
             zf.writestr(item.filename, data)
-        zf.writestr(hostile_name, b"bad")
+        write_member_verbatim(zf, hostile_name, b"bad")
 
     rebuild_with(zip_path, mutate)
     assert pkg.verify_archive(zip_path) == 1
+    assert_failure_line(capsys, "unsafe")
 
 
 # --------------------------------------------------------------------------
