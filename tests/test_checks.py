@@ -640,3 +640,88 @@ def test_utf8_bom_release_config_is_accepted(clean_project: Path) -> None:
         b"\xef\xbb\xbf" + VALID_CONFIG.encode("utf-8")
     )
     assert pkg.load_check_config(clean_project) is not None
+
+
+# --------------------------------------------------------------------------
+# Unicode text encodings (external review, rc4)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "encoding"),
+    [
+        ("deploy.ps1", "utf-16-le"),
+        ("deploy.ps1", "utf-16-be"),
+        ("settings.reg", "utf-16"),
+        ("notes.txt", "utf-8-sig"),
+        ("config.xml", "utf-32"),
+        ("mystery.unknownext", "utf-16"),
+    ],
+)
+def test_secrets_are_found_in_unicode_encodings(
+    clean_project: Path, filename: str, encoding: str
+) -> None:
+    """UTF-16 text is full of NUL bytes, and `b"\\x00" in sample` called it binary.
+
+    A UTF-16LE PowerShell script holding an AWS key was reported as "binary
+    content — not scanned by design" and shipped in a release with exit 0.
+    UTF-16 is ordinary on Windows and in PowerShell workflows, so this is a
+    routine case rather than an exotic one.
+    """
+    target = clean_project / filename
+    target.write_bytes(f'$Key = "{FAKE_AWS_KEY}"\n'.encode(encoding))
+
+    result = pkg.scan_for_secrets(clean_project, [target])
+    assert [f.label for f in result.findings] == ["AWS access key"]
+    assert result.unscanned == []
+
+
+def test_utf16_secret_blocks_release(clean_project: Path, out_dir: Path) -> None:
+    (clean_project / "deploy.ps1").write_bytes(
+        f'$Key = "{FAKE_AWS_KEY}"\n'.encode("utf-16-le")
+    )
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 5
+    assert list(out_dir.glob("*.zip")) == []
+
+
+def test_genuine_binary_with_nuls_is_still_binary(clean_project: Path) -> None:
+    """The NUL heuristic still has a job once Unicode decoding has been tried."""
+    target = clean_project / "blob.dat"
+    target.write_bytes(bytes(range(256)) * 40)
+
+    result = pkg.scan_for_secrets(clean_project, [target])
+    assert result.unscanned[0].kind is pkg.UnscannedKind.BINARY
+
+
+def test_invalid_utf8_text_file_is_not_silently_scanned(clean_project: Path) -> None:
+    """errors="ignore" discarded bytes, so a mangled file counted as scanned.
+
+    A file whose contents cannot be decoded has not been examined, and must be
+    reported as unscanned rather than quietly read with holes in it.
+    """
+    target = clean_project / "broken.py"
+    target.write_bytes(b'KEY = "abc\xff\xfe\xfddef"\n' + b"\xc3\x28" * 200)
+
+    result = pkg.scan_for_secrets(clean_project, [target])
+    assert result.unscanned, "an undecodable file must be reported, not silently read"
+    assert result.unscanned[0].kind is pkg.UnscannedKind.TEXT_LIKE
+
+
+def test_invalid_utf8_text_file_blocks_release(clean_project: Path, out_dir: Path) -> None:
+    (clean_project / "broken.py").write_bytes(b"KEY = \xc3\x28" * 200)
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 5
+
+
+def test_plain_utf8_is_unaffected(clean_project: Path) -> None:
+    target = clean_project / "config.py"
+    target.write_text(f'KEY = "{FAKE_AWS_KEY}"  # café ☕\n', encoding="utf-8")
+    result = pkg.scan_for_secrets(clean_project, [target])
+    assert len(result.findings) == 1

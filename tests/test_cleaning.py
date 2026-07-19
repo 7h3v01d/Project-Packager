@@ -227,3 +227,26 @@ def test_successful_release_still_cleans(clean_project: Path, out_dir: Path) -> 
     )
     assert code == 0
     assert not cache.exists(), "cleaning still happens when the run succeeds"
+
+
+def test_existing_output_without_overwrite_does_not_clean(
+    clean_project: Path, out_dir: Path
+) -> None:
+    """The ordinary refusal path, not just the explicit --overwrite one.
+
+    Output existence was checked inside create_zip(), which runs after
+    cleaning, so the most common refusal of all still mutated the project.
+    """
+    cache = clean_project / "__pycache__"
+    cache.mkdir()
+    (cache / "a.pyc").write_text("cache\n", encoding="utf-8")
+    existing = out_dir / pkg.build_zip_name(clean_project, "rel")
+    existing.write_bytes(b"previous archive")
+
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 3
+    assert cache.is_dir(), "a refused command must leave the project untouched"
+    assert existing.read_bytes() == b"previous archive"

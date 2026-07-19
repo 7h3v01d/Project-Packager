@@ -49,6 +49,7 @@ Standard library only. Python 3.11+ (tomllib). Windows-friendly.
 from __future__ import annotations
 
 import argparse
+import codecs
 import fnmatch
 import hashlib
 import json
@@ -690,20 +691,109 @@ def walk_check_tree(project_dir: Path) -> list[Path]:
 
 
 def looks_binary(sample: bytes) -> bool:
+    """Last-resort heuristic, consulted only after Unicode decoding has failed.
+
+    A NUL byte is a reasonable binary signal for byte-oriented text, but UTF-16
+    encodes ASCII as alternating NULs, so this must never be the *first*
+    question asked. Treating it as such classified UTF-16 PowerShell scripts as
+    binary and shipped the secrets inside them unexamined.
+    """
     return b"\x00" in sample
 
 
+# Ordered longest-first: the UTF-32LE BOM begins with the UTF-16LE BOM, so
+# checking UTF-16 first would mis-detect every UTF-32LE file.
+TEXT_BOMS: tuple[tuple[bytes, str], ...] = (
+    (codecs.BOM_UTF32_LE, "utf-32"),
+    (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF8, "utf-8-sig"),
+    (codecs.BOM_UTF16_LE, "utf-16"),
+    (codecs.BOM_UTF16_BE, "utf-16"),
+)
+
+
+def sniff_utf16(sample: bytes) -> str | None:
+    """Detect BOM-less UTF-16 from its alternating-NUL signature.
+
+    PowerShell, .reg exports, and various Windows tools emit UTF-16LE without a
+    BOM. Mostly-ASCII UTF-16LE puts a NUL in every odd byte position and almost
+    none in even ones; UTF-16BE is the mirror image.
+    """
+    if len(sample) < 8:
+        return None
+    even, odd = sample[0::2], sample[1::2]
+    pairs = min(len(even), len(odd))
+    if pairs == 0:
+        return None
+    even_nuls = even[:pairs].count(0) / pairs
+    odd_nuls = odd[:pairs].count(0) / pairs
+
+    if odd_nuls > 0.3 and even_nuls < 0.1:
+        return "utf-16-le"
+    if even_nuls > 0.3 and odd_nuls < 0.1:
+        return "utf-16-be"
+    return None
+
+
+def detect_text_encoding(sample: bytes) -> str | None:
+    """Return a codec that decodes this sample as text, or None.
+
+    Tries, in order: a Unicode BOM, strict UTF-8, then BOM-less UTF-16.
+    """
+    for bom, codec_name in TEXT_BOMS:
+        if sample.startswith(bom):
+            return codec_name
+
+    # Before UTF-8, because UTF-16LE ASCII *is* valid UTF-8 — it decodes to the
+    # right characters interleaved with NULs, which no pattern then matches.
+    # Plain UTF-8 text contains no NULs, so this cannot misfire on it.
+    guess = sniff_utf16(sample)
+    if guess:
+        try:
+            sample[: len(sample) // 2 * 2].decode(guess)
+            return guess
+        except UnicodeDecodeError:
+            pass
+
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # A sample cut mid-character is not evidence of binary content.
+        if exc.start < len(sample) - 4:
+            return None
+    # Valid UTF-8, but genuine UTF-8 text does not contain NUL bytes. Reaching
+    # here with NULs means the data resolved as UTF-8 only incidentally — it is
+    # not BOM-marked and not UTF-16 — so leave it to the binary heuristic.
+    if looks_binary(sample):
+        return None
+    return "utf-8"
+
+
+def decode_text_strict(data: bytes) -> str | None:
+    """Decode bytes as text, or None if they are not decodable text.
+
+    Strict throughout: `errors="ignore"` silently discarded bytes, so a
+    malformed file counted as successfully scanned when parts of it had never
+    been looked at.
+    """
+    encoding = detect_text_encoding(data[:8192])
+    if encoding is None:
+        return None
+    try:
+        return data.decode(encoding)
+    except (UnicodeDecodeError, UnicodeError):
+        return None
+
+
 def read_text_safe(path: Path, limit: int = SECRET_SCAN_MAX_BYTES) -> str | None:
-    """Read a file as text if it is small and not binary, else None."""
+    """Read a file as text if it is small enough and genuinely decodable."""
     try:
         if path.stat().st_size > limit:
             return None
         data = path.read_bytes()
     except OSError:
         return None
-    if looks_binary(data[:8192]):
-        return None
-    return data.decode("utf-8", errors="ignore")
+    return decode_text_strict(data)
 
 
 class UnscannedKind(StrEnum):
@@ -801,7 +891,20 @@ def classify_unscannable(file_path: Path) -> UnscannedFile | None:
 
     suffix = file_path.suffix.lower()
 
-    if has_binary_magic(sample) or looks_binary(sample):
+    # A recognised signature is definitive.
+    if has_binary_magic(sample):
+        detail = f", {format_bytes(size)}" if size > SECRET_SCAN_MAX_BYTES else ""
+        return UnscannedFile(
+            file_path,
+            f"binary content{detail} — not scanned by design",
+            UnscannedKind.BINARY,
+        )
+
+    # Otherwise try to read it as text before reaching for the NUL heuristic:
+    # UTF-16 is mostly NULs and is ordinary on Windows.
+    encoding = detect_text_encoding(sample)
+
+    if encoding is None and looks_binary(sample):
         detail = f", {format_bytes(size)}" if size > SECRET_SCAN_MAX_BYTES else ""
         return UnscannedFile(
             file_path,
@@ -824,12 +927,20 @@ def classify_unscannable(file_path: Path) -> UnscannedFile | None:
             UnscannedKind.TEXT_LIKE,
         )
 
+    # Not demonstrably binary and within the size limit: it should have been
+    # scannable, so anything that still fails to decode is reported rather than
+    # read with holes in it.
     try:
-        file_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return UnscannedFile(file_path, "not valid UTF-8 text", UnscannedKind.TEXT_LIKE)
+        data = file_path.read_bytes()
     except OSError as exc:
         return UnscannedFile(file_path, f"unreadable: {exc}", UnscannedKind.UNREADABLE)
+
+    if decode_text_strict(data) is None:
+        return UnscannedFile(
+            file_path,
+            "not decodable as UTF-8, UTF-16, or UTF-32 text",
+            UnscannedKind.TEXT_LIKE,
+        )
     return None
 
 
@@ -2132,6 +2243,17 @@ def cmd_package(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return EXIT_SECRETS
+
+    # The most common refusal of all: the output already exists. Checked here,
+    # before anything mutates the project. create_zip() checks again as defence
+    # in depth against a race, but by then cleaning has already run.
+    if output_zip.exists() and not args.overwrite and not args.dry_run:
+        print(
+            f"ERROR: Output already exists: {output_zip}\n"
+            "Use --overwrite or choose a different --name/--output.",
+            file=sys.stderr,
+        )
+        return EXIT_OUTPUT_EXISTS
 
     # Cleaning deletes files, so it happens only once every blocking condition
     # has passed. Previously it ran before the --no-scan, secret, and overwrite

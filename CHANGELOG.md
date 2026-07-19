@@ -4,6 +4,26 @@ All notable changes to Project Packager are recorded here.
 
 ## 3.0.1 — Safety hotfix
 
+### Corrections following external review of 3.0.1-rc4
+
+- **Unicode text is decoded before binary classification.** `looks_binary` was
+  `b"\x00" in sample`, and UTF-16 encodes ASCII as alternating NULs — so a
+  UTF-16LE PowerShell script holding an AWS key was reported as "binary content,
+  not scanned by design" and shipped in a release with exit 0. Detection now
+  tries a Unicode BOM (UTF-8/16/32), then a BOM-less UTF-16 alternating-NUL
+  signature, then strict UTF-8, and only consults the NUL heuristic for data
+  none of those resolve. UTF-16 is ordinary on Windows and in PowerShell
+  workflows, so this was a routine case rather than an exotic one.
+- **Text decoding is strict.** `read_text_safe` used `errors="ignore"`, so a
+  malformed file counted as successfully scanned with bytes silently discarded.
+  Undecodable files are now reported as unscanned text-like and block
+  strict/release packaging.
+- **An existing output ZIP no longer causes cleaning.** Output existence was
+  checked inside `create_zip()`, which runs after cleaning, so the most common
+  refusal of all — packaging twice without `--overwrite` — still deleted cache
+  directories. It is now checked before anything mutates the project, with the
+  original check retained as defence in depth against a race.
+
 ### Corrections following external review of 3.0.1-rc3
 
 - **Binary classification no longer trusts the filename.** A file was treated as
