@@ -1,0 +1,56 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  baseline:
+    name: baseline (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      # Windows runners allow symlink creation, so the symlink containment
+      # tests actually execute rather than skipping.
+      - name: Enable developer mode symlinks (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.symlinks true
+
+      - name: Baseline suite (must be green)
+        run: python -m pytest -m "not defect" -v
+
+  worklist:
+    name: v3.1.0 work list (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      # Expected to fail until the v3.1.0 consolidation pass lands. Kept visible so
+      # the remaining work is measurable on every run rather than forgotten.
+      - name: Defect suite
+        run: python -m pytest -m defect -v
