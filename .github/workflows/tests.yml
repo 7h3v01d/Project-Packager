@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  baseline:
-    name: baseline (${{ matrix.os }}, py${{ matrix.python-version }})
+  tests:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -23,22 +23,30 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install pytest
-        run: python -m pip install --upgrade pip pytest
+      - name: Install dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
 
-      # Windows runners allow symlink creation, so the symlink containment
-      # tests actually execute rather than skipping.
-      - name: Enable developer mode symlinks (Windows)
+      # Windows runners permit symlink creation, so the symlink containment
+      # tests execute rather than skipping. Those cover the P0 privacy defect,
+      # so a run where they silently skip is materially weaker.
+      - name: Enable symlink support (Windows)
         if: runner.os == 'Windows'
         run: git config --global core.symlinks true
 
-      - name: Baseline suite (must be green)
-        run: python -m pytest -m "not defect" -v
+      # The whole suite, exactly as documented. Outstanding v3.1.0 work is
+      # marked xfail(strict=True), so this passes with XFAILs — and a
+      # fixed-but-still-marked test reports as a failure rather than a quiet
+      # XPASS. Deliberately not split into an advisory job with
+      # continue-on-error: that arrangement let CI stay green while the
+      # documented `pytest` command failed and while markers went stale.
+      - name: Full suite
+        run: python -m pytest -rxX
 
-  worklist:
-    name: v3.1.0 work list (informational)
+  self_package:
+    name: packages and verifies itself
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
@@ -47,10 +55,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install pytest
-        run: python -m pip install --upgrade pip pytest
+      # End-to-end smoke test: the tool is its own most convenient real
+      # project, and self-verification exercises manifest, sidecar, and
+      # scanner paths that unit tests stub out.
+      - name: Package this repository
+        run: python project_packager.py package . --output ./_dist --name selftest
 
-      # Expected to fail until the v3.1.0 consolidation pass lands. Kept visible so
-      # the remaining work is measurable on every run rather than forgotten.
-      - name: Defect suite
-        run: python -m pytest -m defect -v
+      - name: Verify the resulting archive
+        run: python project_packager.py verify ./_dist/selftest_*.zip
