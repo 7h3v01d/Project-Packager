@@ -523,3 +523,120 @@ def test_unscanned_kind_is_typed_not_stringly(clean_project: Path) -> None:
     assert kinds["logo.png"] is pkg.UnscannedKind.BINARY
     assert kinds["bundle.js"] is pkg.UnscannedKind.TEXT_LIKE
     assert all(isinstance(entry.kind, pkg.UnscannedKind) for entry in result.unscanned)
+
+
+# --------------------------------------------------------------------------
+# Classification must follow content, not filename (external review, rc3)
+# --------------------------------------------------------------------------
+
+PRINTABLE_FILLER = "Lorem ipsum printable text. "
+
+
+def make_oversized_printable(path: Path, secret: str = "") -> Path:
+    """Entirely printable text, comfortably over the scan limit."""
+    body = PRINTABLE_FILLER * ((pkg.SECRET_SCAN_MAX_BYTES // len(PRINTABLE_FILLER)) + 100)
+    path.write_text(body + f'\nKEY = "{secret}"\n', encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("filename", ["report.pdf", "data.bin", "archive.zip", "lib.so"])
+def test_printable_text_with_a_binary_extension_is_not_trusted(
+    clean_project: Path, filename: str
+) -> None:
+    """A filename does not demonstrate anything about contents.
+
+    Trusting the suffix let an oversized printable file named report.pdf be
+    classified as "binary content, not scanned by design", so a key inside it
+    shipped in a release with exit 0.
+    """
+    target = make_oversized_printable(clean_project / filename, FAKE_AWS_KEY)
+    result = pkg.scan_for_secrets(clean_project, [target])
+
+    assert result.unscanned[0].kind is pkg.UnscannedKind.TEXT_LIKE
+    assert [e.path.name for e in result.unscanned_text_files()] == [filename]
+
+
+def test_printable_text_with_a_binary_extension_blocks_release(
+    clean_project: Path, out_dir: Path
+) -> None:
+    make_oversized_printable(clean_project / "report.pdf", FAKE_AWS_KEY)
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 5
+    assert list(out_dir.glob("*.zip")) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "magic"),
+    [
+        ("logo.png", b"\x89PNG\r\n\x1a\n"),
+        ("scan.pdf", b"%PDF-1.7\n"),
+        ("photo.jpg", b"\xff\xd8\xff\xe0"),
+        ("bundle.gz", b"\x1f\x8b\x08"),
+        ("mystery.unknownext", b"\x00\x01\x02\x03"),
+    ],
+)
+def test_genuine_binary_content_is_recognised(
+    clean_project: Path, filename: str, magic: bytes
+) -> None:
+    """Real binaries are identified by their contents, extension or not."""
+    target = clean_project / filename
+    target.write_bytes(magic + bytes(range(256)) * 5000)
+    result = pkg.scan_for_secrets(clean_project, [target])
+
+    assert result.unscanned[0].kind is pkg.UnscannedKind.BINARY
+    assert result.unscanned_text_files() == []
+
+
+def test_genuine_binary_does_not_block_release(clean_project: Path, out_dir: Path) -> None:
+    (clean_project / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 5000)
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 0
+
+
+# --------------------------------------------------------------------------
+# Ignore-file decoding (external review, rc3)
+# --------------------------------------------------------------------------
+
+
+def test_invalid_utf8_ignore_file_fails_closed(clean_project: Path, out_dir: Path) -> None:
+    """errors="replace" silently rewrote patterns, so exclusions stopped matching.
+
+    A safety configuration file is the last place to guess at damaged bytes.
+    """
+    (clean_project / pkg.IGNORE_FILE_NAME).write_bytes(b"secret\xff.txt\n")
+    write(clean_project / "secret.txt", "private\n")
+
+    code = pkg.main(["package", str(clean_project), "--output", str(out_dir), "--name", "demo"])
+    assert code == 9
+    assert list(out_dir.glob("*.zip")) == []
+
+
+def test_utf8_bom_ignore_file_is_accepted(clean_project: Path, out_dir: Path) -> None:
+    """Windows editors write a BOM; that is ordinary, not corruption."""
+    (clean_project / pkg.IGNORE_FILE_NAME).write_bytes(b"\xef\xbb\xbfsecret.txt\n")
+    write(clean_project / "secret.txt", "private\n")
+
+    code = pkg.main(["package", str(clean_project), "--output", str(out_dir), "--name", "demo"])
+    assert code == 0
+    assert "secret.txt" not in members(sole_zip(out_dir))
+
+
+def test_invalid_utf8_release_config_fails_closed(clean_project: Path) -> None:
+    """UnicodeDecodeError is a ValueError, not an OSError — it was uncaught."""
+    (clean_project / pkg.CHECK_CONFIG_NAME).write_bytes(b'[version]\ntarget = "1.\xff0"\n')
+    with pytest.raises(pkg.ConfigError):
+        pkg.load_check_config(clean_project)
+    assert pkg.main(["check", str(clean_project)]) == 9
+
+
+def test_utf8_bom_release_config_is_accepted(clean_project: Path) -> None:
+    (clean_project / pkg.CHECK_CONFIG_NAME).write_bytes(
+        b"\xef\xbb\xbf" + VALID_CONFIG.encode("utf-8")
+    )
+    assert pkg.load_check_config(clean_project) is not None

@@ -4,6 +4,28 @@ All notable changes to Project Packager are recorded here.
 
 ## 3.0.1 — Safety hotfix
 
+### Corrections following external review of 3.0.1-rc3
+
+- **Binary classification no longer trusts the filename.** A file was treated as
+  binary if its *extension* was known-binary, so an oversized printable file
+  named `report.pdf` was recorded as "binary content, not scanned by design" and
+  a key inside it shipped in a release with exit 0. Classification is now by
+  magic-byte signature and content inspection; the extension only annotates the
+  reason text, and a printable file with a binary-looking name is called out
+  explicitly. This was the most serious remaining privacy defect.
+- **Configuration files are decoded strictly.** `.packagerignore` was read with
+  `errors="replace"`, so invalid UTF-8 silently rewrote patterns — an exclusion
+  stopped matching and the file it named shipped. Both `.packagerignore` and
+  `release_check.toml` now decode as `utf-8-sig` (so a Windows BOM is fine) and
+  raise a configuration error on invalid UTF-8. `release_check.toml` previously
+  surfaced this as an uncaught traceback, since `UnicodeDecodeError` is a
+  `ValueError` rather than an `OSError`.
+- **A refused package no longer mutates the project.** Release mode cleans
+  automatically, and cleaning ran *before* the `--no-scan`, secret, and
+  non-atomic-overwrite refusals — so a command that packaged nothing still
+  deleted cache directories. Cleaning now happens only after every blocking
+  condition has passed, immediately before the archive is written.
+
 ### Corrections following external review of 3.0.1-rc2
 
 - **`release_check.toml` may declare `schema_version`.** Optional for backwards

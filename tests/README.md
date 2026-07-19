@@ -9,8 +9,8 @@ Outstanding work is marked both `defect` (for filtering) and
 `xfail(strict=True)` (for clean pytest semantics), so a normal run is green:
 
 ```bash
-pytest                    # 149 passed, 27 xfailed — the expected release state
-pytest -m "not defect"    # 149 passed — baseline only
+pytest                    # 168 passed, 27 xfailed — the expected release state
+pytest -m "not defect"    # 168 passed — baseline only
 pytest -m defect          # the v3.1.0 work list, as XFAIL
 pytest -rx                # list the outstanding items with their reasons
 ```
@@ -28,7 +28,7 @@ Current state:
 
 | Selection | v3.0.0 | v3.0.1 |
 |-----------|--------|--------|
-| baseline | 85 passed | **149 passed** |
+| baseline | 85 passed | **168 passed** |
 | outstanding | 55 | 27 |
 
 As each defect is fixed, delete both its `@pytest.mark.defect` and

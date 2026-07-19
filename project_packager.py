@@ -436,7 +436,13 @@ def load_ignore_file(project_dir: Path) -> tuple[list[str], int]:
 
     patterns: list[str] = []
     try:
-        text = ignore_path.read_text(encoding="utf-8", errors="replace")
+        # Strict decoding, utf-8-sig so a Windows-authored BOM is fine.
+        # errors="replace" silently rewrote damaged bytes, which changed the
+        # patterns: an exclusion stopped matching and the file it named shipped.
+        # Guessing at corruption in a safety configuration file is not helpful.
+        text = ignore_path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{IGNORE_FILE_NAME} is not valid UTF-8: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"could not read {IGNORE_FILE_NAME}: {exc}") from exc
 
@@ -729,7 +735,38 @@ LIKELY_TEXT_SUFFIXES = {
     ".rb", ".php", ".rs", ".c", ".h", ".cpp", ".hpp",
 }
 
-KNOWN_BINARY_SUFFIXES = {
+BINARY_MAGIC_SIGNATURES: tuple[bytes, ...] = (
+    b"\x89PNG\r\n\x1a\n",      # PNG
+    b"\xff\xd8\xff",           # JPEG
+    b"GIF87a", b"GIF89a",      # GIF
+    b"BM",                     # BMP
+    b"RIFF",                   # WAV / AVI / WEBP
+    b"%PDF-",                  # PDF
+    b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08",  # ZIP family, incl. wheels
+    b"\x1f\x8b",               # gzip
+    b"BZh",                    # bzip2
+    b"\xfd7zXZ\x00",           # xz
+    b"7z\xbc\xaf\x27\x1c",     # 7z
+    b"Rar!\x1a\x07",           # RAR
+    b"\x7fELF",                # ELF
+    b"MZ",                     # PE / DOS
+    b"\xca\xfe\xba\xbe",       # Java class / Mach-O fat
+    b"\xcf\xfa\xed\xfe",       # Mach-O
+    b"OggS",                   # Ogg
+    b"fLaC",                   # FLAC
+    b"ID3",                    # MP3 with ID3
+    b"\x00\x01\x00\x00\x00",   # TrueType
+    b"OTTO",                   # OpenType
+    b"wOFF", b"wOF2",          # WOFF
+    b"\xed\xab\xee\xdb",       # RPM
+    b"SQLite format 3\x00",    # SQLite
+)
+
+# Retained only to explain a decision in the reason text. Deliberately NOT used
+# to classify: a filename asserts nothing about contents, and trusting it let an
+# oversized printable file named report.pdf be recorded as "binary content, not
+# scanned by design" while a key inside it shipped.
+BINARY_SUFFIX_HINTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff",
     ".pdf", ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tar", ".whl", ".exe",
     ".dll", ".so", ".dylib", ".bin", ".dat", ".mp3", ".mp4", ".mov", ".avi",
@@ -737,13 +774,19 @@ KNOWN_BINARY_SUFFIXES = {
 }
 
 
+def has_binary_magic(sample: bytes) -> bool:
+    """True if the sample opens with a recognised binary file signature."""
+    return any(sample.startswith(sig) for sig in BINARY_MAGIC_SIGNATURES)
+
+
 def classify_unscannable(file_path: Path) -> UnscannedFile | None:
     """Explain why a file cannot be secret-scanned, or None if it can be.
 
-    Content is sampled *before* size is considered, so a large binary asset is
-    recognised as binary rather than as an oversized text file. Anything not
-    demonstrably binary is treated conservatively as text-like, since that is
-    the classification that blocks a release.
+    Content decides. The sample is read before size is considered, so a large
+    binary asset is recognised as binary rather than as an oversized text file,
+    and anything not *demonstrably* binary is treated conservatively as
+    text-like — including when its extension suggests otherwise, since the
+    extension is the one thing an attacker or an accident controls freely.
     """
     try:
         size = file_path.stat().st_size
@@ -757,22 +800,27 @@ def classify_unscannable(file_path: Path) -> UnscannedFile | None:
         return UnscannedFile(file_path, f"unreadable: {exc}", UnscannedKind.UNREADABLE)
 
     suffix = file_path.suffix.lower()
-    if looks_binary(sample) or suffix in KNOWN_BINARY_SUFFIXES:
-        if size > SECRET_SCAN_MAX_BYTES:
-            return UnscannedFile(
-                file_path,
-                f"binary content, {format_bytes(size)} — not scanned by design",
-                UnscannedKind.BINARY,
-            )
+
+    if has_binary_magic(sample) or looks_binary(sample):
+        detail = f", {format_bytes(size)}" if size > SECRET_SCAN_MAX_BYTES else ""
         return UnscannedFile(
-            file_path, "binary content — not scanned by design", UnscannedKind.BINARY
+            file_path,
+            f"binary content{detail} — not scanned by design",
+            UnscannedKind.BINARY,
         )
 
     if size > SECRET_SCAN_MAX_BYTES:
+        # Printable content with a binary-looking name is exactly the case that
+        # must not be waved through, so the mismatch is called out explicitly.
+        mismatch = (
+            f" (despite the {suffix} extension, its contents are printable text)"
+            if suffix in BINARY_SUFFIX_HINTS
+            else ""
+        )
         return UnscannedFile(
             file_path,
             f"too large: {format_bytes(size)} exceeds the "
-            f"{format_bytes(SECRET_SCAN_MAX_BYTES)} scan limit",
+            f"{format_bytes(SECRET_SCAN_MAX_BYTES)} scan limit{mismatch}",
             UnscannedKind.TEXT_LIKE,
         )
 
@@ -1335,7 +1383,11 @@ def load_check_config(project_dir: Path) -> dict | None:
         ) from exc
 
     try:
-        text = config_path.read_text(encoding="utf-8")
+        text = config_path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        # UnicodeDecodeError is a ValueError, not an OSError, so it previously
+        # escaped this handler entirely and surfaced as a traceback.
+        raise ConfigError(f"{CHECK_CONFIG_NAME} is not valid UTF-8: {exc}") from exc
     except OSError as exc:
         raise ConfigError(f"could not read {CHECK_CONFIG_NAME}: {exc}") from exc
 
@@ -2011,14 +2063,6 @@ def cmd_package(args: argparse.Namespace) -> int:
 
     cleaned_dirs = 0
     cleaned_files = 0
-    if clean:
-        cleaned_dirs, cleaned_files = remove_clean_targets(scan, dry_run=args.dry_run)
-
-        # If actual cleaning happened, rescan so deleted junk no longer appears.
-        if not args.dry_run:
-            scan = scan_project(
-                project_dir, rules, output_dir=output_dir, output_zip=output_zip
-            )
 
     # Replacement is not atomic until v3.1.0, so a failed write can destroy a
     # good archive. Refused where that matters most, unless stated explicitly.
@@ -2088,6 +2132,19 @@ def cmd_package(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return EXIT_SECRETS
+
+    # Cleaning deletes files, so it happens only once every blocking condition
+    # has passed. Previously it ran before the --no-scan, secret, and overwrite
+    # refusals, so a command that packaged nothing still mutated the project.
+    # A failed package must not change anything it was not asked to change.
+    if clean:
+        cleaned_dirs, cleaned_files = remove_clean_targets(scan, dry_run=args.dry_run)
+
+        # Rescan so deleted junk no longer appears in the manifest or summary.
+        if not args.dry_run and (cleaned_dirs or cleaned_files):
+            scan = scan_project(
+                project_dir, rules, output_dir=output_dir, output_zip=output_zip
+            )
 
     zip_uncompressed_bytes = 0
     zip_sha256 = ""

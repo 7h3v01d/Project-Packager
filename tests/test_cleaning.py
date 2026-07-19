@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import DEFECT_REASON
 from conftest import pkg, scan, write
 
 
@@ -126,6 +127,7 @@ def test_cleaning_does_not_follow_a_symlinked_cache(
 
 
 @pytest.mark.defect
+@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_cleaning_refuses_a_target_that_moved_outside_the_project(
     demo_project: Path, tmp_path: Path, out_dir: Path
 ) -> None:
@@ -143,6 +145,7 @@ def test_cleaning_refuses_a_target_that_moved_outside_the_project(
 
 
 @pytest.mark.defect
+@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_cleaning_refuses_a_target_with_an_unapproved_name(
     demo_project: Path, out_dir: Path
 ) -> None:
@@ -162,3 +165,65 @@ def test_clean_then_rescan_drops_removed_junk(demo_project: Path, out_dir: Path)
     )
     assert code == 0
     assert not (demo_project / "__pycache__").exists()
+
+
+# --------------------------------------------------------------------------
+# A failed command must not mutate the project (external review, rc3)
+# --------------------------------------------------------------------------
+
+
+def test_refused_package_does_not_clean_the_project(clean_project: Path, out_dir: Path) -> None:
+    """Release mode cleans automatically, but cleaning ran before the checks
+    that refuse the run — so a command that packaged nothing still deleted
+    cache directories."""
+    cache = clean_project / "__pycache__"
+    cache.mkdir()
+    (cache / "a.pyc").write_text("cache\n", encoding="utf-8")
+
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel", "--no-scan"]
+    )
+    assert code == 5
+    assert cache.is_dir(), "a refused command must leave the project untouched"
+
+
+def test_secret_failure_does_not_clean_the_project(clean_project: Path, out_dir: Path) -> None:
+    cache = clean_project / "__pycache__"
+    cache.mkdir()
+    (cache / "a.pyc").write_text("cache\n", encoding="utf-8")
+    write(clean_project / "config.py", 'KEY = "AKIA' + "Q" * 16 + '"\n')
+
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 5
+    assert cache.is_dir()
+
+
+def test_refused_overwrite_does_not_clean_the_project(clean_project: Path, out_dir: Path) -> None:
+    cache = clean_project / "__pycache__"
+    cache.mkdir()
+    (cache / "a.pyc").write_text("cache\n", encoding="utf-8")
+    (out_dir / pkg.build_zip_name(clean_project, "rel")).write_bytes(b"previous")
+
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release", "--output", str(out_dir),
+         "--name", "rel", "--overwrite"]
+    )
+    assert code != 0
+    assert cache.is_dir()
+
+
+def test_successful_release_still_cleans(clean_project: Path, out_dir: Path) -> None:
+    cache = clean_project / "__pycache__"
+    cache.mkdir()
+    (cache / "a.pyc").write_text("cache\n", encoding="utf-8")
+
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 0
+    assert not cache.exists(), "cleaning still happens when the run succeeds"
