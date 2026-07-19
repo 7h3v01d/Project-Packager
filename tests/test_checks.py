@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from conftest import DEFECT_REASON
-from conftest import assert_reason_reported, pkg, sole_zip, write
+from conftest import assert_reason_reported, members, pkg, sole_zip, write
 
 VALID_CONFIG = """\
 [version]
@@ -205,12 +205,21 @@ def test_force_overrides_the_secret_block(clean_project: Path, out_dir: Path) ->
 
 
 def test_no_scan_disables_detection(clean_project: Path, out_dir: Path) -> None:
+    """--no-scan skips the gate, but strict mode now requires --force with it.
+
+    Contract changed after external review: silently disabling the gate that
+    strict mode exists to enforce was judged a trap. Outside strict mode,
+    --no-scan alone is still enough.
+    """
     write(clean_project / "config.py", f'AWS_KEY = "{FAKE_AWS_KEY}"\n')
-    code = pkg.main(
+    assert pkg.main(
         ["package", str(clean_project), "--output", str(out_dir),
-         "--name", "demo", "--strict", "--no-scan"]
-    )
-    assert code == 0
+         "--name", "share", "--no-scan"]
+    ) == 0
+    assert pkg.main(
+        ["package", str(clean_project), "--output", str(out_dir),
+         "--name", "demo", "--strict", "--no-scan", "--force"]
+    ) == 0
 
 
 def test_complete_secrets_are_never_printed(clean_project: Path, out_dir: Path, capsys) -> None:
@@ -309,10 +318,208 @@ def test_unreadable_ignore_file_fails_closed_in_release(clean_project: Path, out
     assert list(out_dir.glob("*.zip")) == []
 
 
-def test_unreadable_ignore_file_warns_in_share_mode(clean_project: Path, out_dir: Path, capsys) -> None:
-    """Ordinary sharing stays usable, but says plainly what was lost."""
-    (clean_project / pkg.IGNORE_FILE_NAME).mkdir()
+def test_absent_ignore_file_is_not_an_error(clean_project: Path, out_dir: Path) -> None:
+    """No ignore file means no exclusions were asked for, which is fine.
 
+    Replaces an earlier test asserting that an *unreadable* ignore file merely
+    warned in share mode. External review rejected that split, correctly: an
+    unusable ignore file is evidence exclusions were intended, and share mode
+    is where losing them leaks something.
+    """
+    assert not (clean_project / pkg.IGNORE_FILE_NAME).exists()
     code = pkg.main(["package", str(clean_project), "--output", str(out_dir), "--name", "demo"])
-    combined = (capsys.readouterr().out + capsys.readouterr().err).lower()
     assert code == 0
+
+
+# --------------------------------------------------------------------------
+# Unscanned classification and gate consolidation (external review, rc2)
+# --------------------------------------------------------------------------
+
+
+def make_large_binary(path: Path) -> Path:
+    """A binary asset comfortably over the scan limit."""
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02\x03" * (pkg.SECRET_SCAN_MAX_BYTES // 2))
+    return path
+
+
+def make_large_text(path: Path, secret: str = "") -> Path:
+    path.write_text("x" * (pkg.SECRET_SCAN_MAX_BYTES + 10) + f'\nKEY = "{secret}"\n',
+                    encoding="utf-8")
+    return path
+
+
+def test_large_binary_asset_does_not_block_release(clean_project: Path, out_dir: Path) -> None:
+    """Size must not be mistaken for textiness.
+
+    Classifying by size before sampling content made every image, PDF, wheel,
+    or media file over 1 MiB block strict/release packaging.
+    """
+    make_large_binary(clean_project / "logo.png")
+    code = pkg.main(
+        ["package", str(clean_project), "--output", str(out_dir), "--name", "demo", "--strict"]
+    )
+    assert code == 0, "a large binary asset is not an unscanned text file"
+
+
+def test_large_binary_is_reported_as_binary_not_text(clean_project: Path) -> None:
+    big = make_large_binary(clean_project / "logo.png")
+    result = pkg.scan_for_secrets(clean_project, [big])
+
+    assert result.unscanned, "the skip should still be recorded"
+    assert result.unscanned_text_files() == [], "but not as a text file"
+    kinds = {entry.kind for entry in result.unscanned}
+    assert "binary" in kinds
+
+
+def test_large_text_still_blocks_release(clean_project: Path, out_dir: Path) -> None:
+    make_large_text(clean_project / "bundle.js", FAKE_AWS_KEY)
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 5, "unscannable text blocks with the secret code, in every profile"
+
+
+def test_unknown_suffix_is_treated_conservatively_as_text(clean_project: Path) -> None:
+    """Anything not demonstrably binary is assumed to be text-like."""
+    odd = clean_project / "data.weirdext"
+    odd.write_text("y" * (pkg.SECRET_SCAN_MAX_BYTES + 10), encoding="utf-8")
+    result = pkg.scan_for_secrets(clean_project, [odd])
+    assert [entry.path.name for entry in result.unscanned_text_files()] == ["data.weirdext"]
+
+
+def test_secret_in_included_file_exits_5_in_release_mode(clean_project: Path, out_dir: Path) -> None:
+    """One gate, one code. Release used to exit 6 via the pre-check scanner."""
+    write(clean_project / "config.py", f'KEY = "{FAKE_AWS_KEY}"\n')
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 5
+    assert list(out_dir.glob("*.zip")) == []
+
+
+def test_secret_in_excluded_file_does_not_block_release(clean_project: Path, out_dir: Path) -> None:
+    """What blocks the package must match what the package contains.
+
+    Release mode excludes .env from the archive, so a key there is not shipped
+    and must not fail the run.
+    """
+    write(clean_project / ".env", f'AWS_KEY = "{FAKE_AWS_KEY}"\n')
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 0
+    assert ".env" not in members(sole_zip(out_dir))
+
+
+def test_exit_6_still_covers_non_secret_check_failures(clean_project: Path, out_dir: Path) -> None:
+    write(clean_project / "patch_thing.py", "# session debris\n")
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 6
+
+
+def test_no_scan_is_refused_in_strict_mode_without_force(clean_project: Path, out_dir: Path) -> None:
+    """Silently disabling the gate in the mode that exists to enforce it is a trap."""
+    code = pkg.main(
+        ["package", str(clean_project), "--output", str(out_dir),
+         "--name", "demo", "--strict", "--no-scan"]
+    )
+    assert code != 0
+
+
+def test_no_scan_with_force_is_permitted_in_strict_mode(clean_project: Path, out_dir: Path) -> None:
+    code = pkg.main(
+        ["package", str(clean_project), "--output", str(out_dir),
+         "--name", "demo", "--strict", "--no-scan", "--force"]
+    )
+    assert code == 0
+
+
+def test_unreadable_ignore_file_fails_closed_in_share_mode(clean_project: Path, out_dir: Path) -> None:
+    """An unusable ignore file is evidence exclusions were intended.
+
+    Share mode is exactly where people rely on .packagerignore to keep private
+    notes and local config out of an archive they are about to send someone.
+    """
+    (clean_project / pkg.IGNORE_FILE_NAME).mkdir()
+    code = pkg.main(["package", str(clean_project), "--output", str(out_dir), "--name", "demo"])
+    assert code == 9
+    assert list(out_dir.glob("*.zip")) == []
+
+
+def test_force_does_not_bypass_ignore_file_failure(clean_project: Path, out_dir: Path) -> None:
+    (clean_project / pkg.IGNORE_FILE_NAME).mkdir()
+    code = pkg.main(
+        ["package", str(clean_project), "--output", str(out_dir), "--name", "demo", "--force"]
+    )
+    assert code == 9, "--force is for judgement calls, not for unusable configuration"
+
+
+# --------------------------------------------------------------------------
+# Config schema version (raised in both external reviews)
+# --------------------------------------------------------------------------
+
+
+def test_schema_version_is_accepted(clean_project: Path) -> None:
+    write(clean_project / pkg.CHECK_CONFIG_NAME, "schema_version = 1\n\n" + VALID_CONFIG)
+    config = pkg.load_check_config(clean_project)
+    assert config is not None
+
+
+def test_config_without_schema_version_still_loads(clean_project: Path) -> None:
+    """Existing configurations must keep working; the field is optional."""
+    write(clean_project / pkg.CHECK_CONFIG_NAME, VALID_CONFIG)
+    assert pkg.load_check_config(clean_project) is not None
+
+
+def test_future_schema_version_fails_closed(clean_project: Path) -> None:
+    """A newer format this build cannot interpret must not be half-applied.
+
+    Without a declared version, a future release that changes field meanings
+    would be silently misread by an older build — the gate would run, and run
+    wrong.
+    """
+    write(
+        clean_project / pkg.CHECK_CONFIG_NAME,
+        f"schema_version = {pkg.CHECK_CONFIG_SCHEMA_VERSION + 1}\n\n" + VALID_CONFIG,
+    )
+    with pytest.raises(pkg.ConfigError):
+        pkg.load_check_config(clean_project)
+    assert pkg.main(["check", str(clean_project)]) == 9
+
+
+def test_non_integer_schema_version_fails(clean_project: Path) -> None:
+    write(clean_project / pkg.CHECK_CONFIG_NAME, 'schema_version = "one"\n\n' + VALID_CONFIG)
+    assert pkg.main(["check", str(clean_project)]) == 9
+
+
+def test_init_template_declares_a_schema_version(clean_project: Path) -> None:
+    pkg.main(["init", str(clean_project)])
+    text = (clean_project / pkg.CHECK_CONFIG_NAME).read_text(encoding="utf-8")
+    assert "schema_version" in text
+    assert pkg.load_check_config(clean_project) is not None
+
+
+# --------------------------------------------------------------------------
+# Typed unscanned classification
+# --------------------------------------------------------------------------
+
+
+def test_unscanned_kind_is_typed_not_stringly(clean_project: Path) -> None:
+    """Policy is driven by an enum, not by the wording of a reason string."""
+    make_large_binary(clean_project / "logo.png")
+    make_large_text(clean_project / "bundle.js")
+
+    result = pkg.scan_for_secrets(
+        clean_project, [clean_project / "logo.png", clean_project / "bundle.js"]
+    )
+    kinds = {entry.path.name: entry.kind for entry in result.unscanned}
+
+    assert kinds["logo.png"] is pkg.UnscannedKind.BINARY
+    assert kinds["bundle.js"] is pkg.UnscannedKind.TEXT_LIKE
+    assert all(isinstance(entry.kind, pkg.UnscannedKind) for entry in result.unscanned)

@@ -9,8 +9,8 @@ Outstanding work is marked both `defect` (for filtering) and
 `xfail(strict=True)` (for clean pytest semantics), so a normal run is green:
 
 ```bash
-pytest                    # 123 passed, 28 xfailed — the expected release state
-pytest -m "not defect"    # 123 passed — baseline only
+pytest                    # 149 passed, 27 xfailed — the expected release state
+pytest -m "not defect"    # 149 passed — baseline only
 pytest -m defect          # the v3.1.0 work list, as XFAIL
 pytest -rx                # list the outstanding items with their reasons
 ```
@@ -20,12 +20,16 @@ pytest -rx                # list the outstanding items with their reasons
 review pass — `test_secret_scan_reports_skipped_files` was fixed as a side
 effect of other work and would otherwise have sat marked as outstanding.
 
+If your run does not match the line below, you are looking at a different build
+than the one documented here — check before reporting the difference as a
+regression.
+
 Current state:
 
 | Selection | v3.0.0 | v3.0.1 |
 |-----------|--------|--------|
-| baseline | 85 passed | **123 passed** |
-| outstanding | 55 | 28 |
+| baseline | 85 passed | **149 passed** |
+| outstanding | 55 | 27 |
 
 As each defect is fixed, delete both its `@pytest.mark.defect` and
 `@pytest.mark.xfail` decorators. When the

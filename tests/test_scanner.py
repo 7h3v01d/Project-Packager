@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import DEFECT_REASON
 from conftest import (
     pkg,
     make_demo_project,
@@ -118,6 +119,7 @@ def test_packagerignore_rules_are_applied(demo_project: Path, out_dir: Path) -> 
 
 
 @pytest.mark.defect
+@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_later_rules_override_earlier_rules(demo_project: Path, out_dir: Path) -> None:
     """Legacy test 6, adapted — report: 'later rules override earlier rules'.
 
@@ -282,17 +284,15 @@ def test_windows_style_separators_are_normalised(demo_project: Path, out_dir: Pa
     assert "large_data/data.csv" not in rel_included(result, demo_project)
 
 
-@pytest.mark.defect
-def test_path_patterns_are_root_anchored(tmp_path: Path, out_dir: Path) -> None:
-    """Report rule-engine requirement: 'Root-anchored patterns'.
+def test_bare_directory_pattern_matches_at_any_depth(tmp_path: Path, out_dir: Path) -> None:
+    """gitignore semantics: `docs/` means a directory named docs, anywhere.
 
-    Found during suite construction, beyond the report's P0 list: build_rules
-    files a trailing-slash pattern like "docs/" into rules.dir_patterns, which
-    should_exclude_dir matches against the bare directory *name*. Any docs/
-    directory at any depth is therefore pruned, so an exclusion aimed at the
-    project root silently removes unrelated nested trees.
+    An earlier version of this test asserted the opposite — that a trailing
+    slash alone made a pattern root-only. External review rejected that as a
+    surprising contract that would have locked the v3.1.0 rule engine into
+    non-standard behaviour. Recorded here as the intended contract instead.
     """
-    project = make_demo_project(tmp_path, name="anchored")
+    project = make_demo_project(tmp_path, name="anydepth")
     write(project / "docs" / "guide.md", "top level docs\n")
     write(project / "src" / "docs" / "internal.md", "nested docs\n")
 
@@ -300,7 +300,53 @@ def test_path_patterns_are_root_anchored(tmp_path: Path, out_dir: Path) -> None:
     included = rel_included(result, project)
 
     assert "docs/guide.md" not in included
-    assert "src/docs/internal.md" in included
+    assert "src/docs/internal.md" not in included
+
+
+def test_leading_slash_pattern_is_root_anchored(tmp_path: Path, out_dir: Path) -> None:
+    """`/docs/` means the project-root docs directory and nothing else.
+
+    v3.0.1-rc2 dropped leading-slash patterns entirely: the pattern could never
+    match anything, so a user who wrote it got no exclusion at all and no
+    warning. Silently discarding a rule someone wrote is the same failure mode
+    as an unreadable ignore file being treated as an absent one.
+    """
+    project = make_demo_project(tmp_path, name="anchored")
+    write(project / "docs" / "guide.md", "top level docs\n")
+    write(project / "src" / "docs" / "internal.md", "nested docs\n")
+
+    result = scan(project, exclude=["/docs/"], output_dir=out_dir)
+    included = rel_included(result, project)
+
+    assert "docs/guide.md" not in included
+    assert "src/docs/internal.md" in included, "only the root docs/ was excluded"
+
+
+def test_relative_subtree_pattern_matches_only_that_subtree(
+    tmp_path: Path, out_dir: Path
+) -> None:
+    """`src/docs/` means that specific relative subtree."""
+    project = make_demo_project(tmp_path, name="subtree")
+    write(project / "docs" / "guide.md", "top level docs\n")
+    write(project / "src" / "docs" / "internal.md", "nested docs\n")
+
+    result = scan(project, exclude=["src/docs/"], output_dir=out_dir)
+    included = rel_included(result, project)
+
+    assert "src/docs/internal.md" not in included
+    assert "docs/guide.md" in included
+
+
+def test_leading_slash_file_pattern_is_root_anchored(tmp_path: Path, out_dir: Path) -> None:
+    project = make_demo_project(tmp_path, name="anchoredfile")
+    write(project / "notes.md", "root notes\n")
+    write(project / "src" / "notes.md", "nested notes\n")
+
+    result = scan(project, exclude=["/notes.md"], output_dir=out_dir)
+    included = rel_included(result, project)
+
+    assert "notes.md" not in included
+    assert "src/notes.md" in included
 
 
 def test_backup_profile_keeps_build_venv_and_debris(demo_project: Path, out_dir: Path) -> None:

@@ -4,6 +4,53 @@ All notable changes to Project Packager are recorded here.
 
 ## 3.0.1 — Safety hotfix
 
+### Corrections following external review of 3.0.1-rc2
+
+- **`release_check.toml` may declare `schema_version`.** Optional for backwards
+  compatibility; a version newer than the build understands is refused rather
+  than half-interpreted. `init` writes it by default. Raised in two successive
+  reviews.
+- **Unscanned-file classification is typed.** `UnscannedKind` is a `StrEnum`
+  (`BINARY`, `TEXT_LIKE`, `UNREADABLE`) rather than a bare string, so blocking
+  policy cannot drift back to being derived from the wording of a reason string.
+
+
+- **Unscanned files are classified by content, not size.** Sampling happened
+  after the size check, and any oversized file was then treated as text, so a
+  1 MiB PNG blocked strict/release packaging and was described as an unscanned
+  text file. Classification now samples first and records a structured
+  `UnscannedFile(path, reason, kind)`; binary assets are noted but do not block,
+  and anything not demonstrably binary is treated conservatively as text.
+- **One secret gate, one exit code.** Release packaging previously scanned twice
+  — once over the whole working tree during pre-checks, once over the inclusion
+  set during packaging — returning `6` in release and `5` under `--strict` for
+  the same problem, ignoring `--no-scan` in the first pass, and blocking on
+  secrets in files the release profile excludes anyway. Packaging now runs the
+  non-secret release checks, then scans exactly the files that will ship. Exit
+  `5` covers secrets and unscannable text in both modes; exit `6` is reserved
+  for non-secret check failures. `check` still scans the broader tree.
+- **`--no-scan` requires `--force` in strict/release mode.**
+- **`.packagerignore` fails closed in every profile**, not just strict/release.
+  An unusable ignore file is evidence that exclusions were intended, and share
+  mode is where losing them leaks something. Not overridable with `--force`.
+- **Leading-slash patterns are honoured.** `/docs/` was silently discarded — it
+  could never match, so the user got no exclusion and no warning. Anchoring now
+  follows gitignore conventions: `docs/` matches at any depth, `/docs/` matches
+  the project-root directory only, `src/docs/` matches that subtree.
+- **No manifest and no sidecar now fails the package**, in any profile, and the
+  summary no longer claims partial verification when no sidecar was written.
+- **`--overwrite` is refused in strict/release mode** until atomic replacement
+  lands in v3.1.0, since a failed write can destroy the existing archive.
+  Overridable with `--force`.
+- Exit codes are centralised in an `Exit` IntEnum and documented as part of the
+  CLI contract; code `10` added to the README table.
+- CI now runs the full documented `pytest` on every matrix entry. The previous
+  advisory job used `continue-on-error`, so CI could stay green while the
+  documented command failed or an xfail marker went stale. A self-package job
+  packages and verifies the repository end to end.
+- README gained a Current Limitations section covering non-atomic replacement,
+  unhardened cleaning, and the verifier's non-adversarial scope.
+
 ### Corrections following external review of 3.0.1-rc1
 
 - **`PACKAGE_MANIFEST.json` is now reserved unconditionally.** The collision
@@ -80,8 +127,9 @@ or privacy defect found during the v3.0.0 review.
   embedded manifest to check its contents against.
 - Skipped-symlink count in the packaging summary.
 - Distinct exit code 10 for containment failures.
-- A 151-test regression suite (`tests/`). The included CI workflow targets
-  Windows and Linux on Python 3.11–3.13; verified locally on Linux only.
+- A 170-test regression suite (`tests/`). The included CI workflow runs the
+  full suite on Windows and Linux across Python 3.11–3.13 and packages the
+  repository as an end-to-end check.
 
 ### Known limitations
 
@@ -98,8 +146,6 @@ Carried forward to v3.1.0, and covered by tests currently marked `defect`:
   malformed manifest structure, or metadata disagreement, and reads members
   whole rather than streaming them.
 - Cleaning does not yet revalidate containment immediately before deletion.
-- Exclusion patterns are matched by directory name at any depth rather than
-  being root-anchored, so `--exclude "docs/"` also excludes `src/docs/`.
 - Documentation still describes integrity verification in terms that could be
   read as authenticated signing.
 

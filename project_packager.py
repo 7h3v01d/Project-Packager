@@ -60,6 +60,7 @@ import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass, field
+from enum import IntEnum, StrEnum
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -75,18 +76,40 @@ IGNORE_FILE_NAME = ".packagerignore"
 # Exit codes
 # --------------------------------------------------------------------------
 
-EXIT_OK = 0
-EXIT_PROBLEMS = 1          # check failures / verification problems
-EXIT_BAD_PROJECT = 2       # project path missing or not a directory
-EXIT_OUTPUT_EXISTS = 3     # output ZIP already exists (use --overwrite)
-EXIT_OS_ERROR = 4          # OS error while writing
-EXIT_SECRETS = 5           # secrets found in strict/release mode
-EXIT_CHECKS_FAILED = 6     # pre-package release checks failed
-EXIT_PARTIAL = 7           # sidecar valid but no embedded manifest to verify
-EXIT_RESERVED_NAME = 8     # project file collides with reserved internal name
-EXIT_BAD_CONFIG = 9        # release_check.toml or .packagerignore present but
-                           # unreadable, malformed, or structurally invalid
-EXIT_CONTAINMENT = 10      # a source path escaped the project between scan and write
+class Exit(IntEnum):
+    """Exit codes. Part of the CLI contract — automation depends on these.
+
+    Kept granular deliberately: a CI job should be able to distinguish "your
+    project has a problem" from "your configuration is broken" from "this tool
+    refused on safety grounds" without parsing output.
+    """
+
+    OK = 0
+    PROBLEMS = 1          # check failures / verification problems
+    BAD_PROJECT = 2       # project path missing or not a directory
+    OUTPUT_EXISTS = 3     # output ZIP already exists (use --overwrite)
+    OS_ERROR = 4          # OS error while writing, or no verification evidence
+    SECRETS = 5           # secrets, or unscannable text, in strict/release mode
+    CHECKS_FAILED = 6     # non-secret pre-package release checks failed
+    PARTIAL = 7           # sidecar valid but no embedded manifest to verify
+    RESERVED_NAME = 8     # project file collides with reserved internal name
+    BAD_CONFIG = 9        # release_check.toml or .packagerignore present but
+                          # unreadable, malformed, or structurally invalid
+    CONTAINMENT = 10      # a source path escaped the project between scan and write
+
+
+# Module-level aliases, so call sites stay readable.
+EXIT_OK = Exit.OK
+EXIT_PROBLEMS = Exit.PROBLEMS
+EXIT_BAD_PROJECT = Exit.BAD_PROJECT
+EXIT_OUTPUT_EXISTS = Exit.OUTPUT_EXISTS
+EXIT_OS_ERROR = Exit.OS_ERROR
+EXIT_SECRETS = Exit.SECRETS
+EXIT_CHECKS_FAILED = Exit.CHECKS_FAILED
+EXIT_PARTIAL = Exit.PARTIAL
+EXIT_RESERVED_NAME = Exit.RESERVED_NAME
+EXIT_BAD_CONFIG = Exit.BAD_CONFIG
+EXIT_CONTAINMENT = Exit.CONTAINMENT
 
 
 class ConfigError(Exception):
@@ -395,35 +418,27 @@ def should_exclude_file(file_name: str, rel_posix: str, rules: Rules) -> str | N
 # --------------------------------------------------------------------------
 
 
-def load_ignore_file(project_dir: Path, *, strict: bool = False) -> tuple[list[str], int]:
+def load_ignore_file(project_dir: Path) -> tuple[list[str], int]:
     """Load .packagerignore patterns. Returns (patterns, count).
 
-    A file that exists but cannot be read means every project-specific
-    exclusion is silently lost. In strict/release mode that fails closed with
-    ConfigError; for ordinary sharing it warns loudly and continues.
+    Fails closed in every profile. An absent ignore file means no exclusions
+    were asked for; a file that exists but cannot be read means exclusions
+    *were* asked for and have been lost. Ordinary sharing is exactly where
+    people rely on this to keep private notes and local config out of an
+    archive they are about to send someone, so it is not the place to
+    downgrade the failure to a warning.
     """
     ignore_path = project_dir / IGNORE_FILE_NAME
     if not ignore_path.exists():
         return [], 0
     if not ignore_path.is_file():
-        message = f"{IGNORE_FILE_NAME} exists but is not a regular file"
-        if strict:
-            raise ConfigError(message)
-        print(f"WARNING: {message} — no project exclusions loaded", file=sys.stderr)
-        return [], 0
+        raise ConfigError(f"{IGNORE_FILE_NAME} exists but is not a regular file")
 
     patterns: list[str] = []
     try:
         text = ignore_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        message = f"could not read {IGNORE_FILE_NAME}: {exc}"
-        if strict:
-            raise ConfigError(message) from exc
-        print(
-            f"WARNING: {message} — no project exclusions loaded",
-            file=sys.stderr,
-        )
-        return [], 0
+        raise ConfigError(f"could not read {IGNORE_FILE_NAME}: {exc}") from exc
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -462,13 +477,24 @@ def build_rules(
         pattern = normalise_pattern(raw_pattern)
         if not pattern:
             continue
+
+        # A leading slash anchors the pattern to the project root, as in
+        # gitignore. Without this, "/docs/" became the path pattern "/docs",
+        # which can never match a relative path — the rule was silently
+        # discarded and the user got no exclusion and no warning.
+        anchored = pattern.startswith("/")
+        if anchored:
+            pattern = pattern.lstrip("/")
+            if not pattern:
+                continue
+
         if pattern.endswith("/"):
             clean = pattern.rstrip("/")
-            if "/" in clean:
+            if anchored or "/" in clean:
                 rules.path_patterns.add(clean)
             else:
                 rules.dir_patterns.add(clean)
-        elif "/" in pattern:
+        elif anchored or "/" in pattern:
             rules.path_patterns.add(pattern)
         else:
             rules.file_patterns.add(pattern)
@@ -674,6 +700,91 @@ def read_text_safe(path: Path, limit: int = SECRET_SCAN_MAX_BYTES) -> str | None
     return data.decode("utf-8", errors="ignore")
 
 
+class UnscannedKind(StrEnum):
+    """Why a file was not scanned, in the terms policy cares about."""
+
+    BINARY = "binary"        # recognised asset; never a scan candidate
+    TEXT_LIKE = "text-like"  # could hold a secret; blocks strict/release
+    UNREADABLE = "unreadable"  # treated conservatively as text-like
+
+
+@dataclass(frozen=True)
+class UnscannedFile:
+    """A file the secret scanner could not read, and why.
+
+    `kind` drives policy; `reason` is for humans. Deriving the first from the
+    second is how a 1 MiB PNG came to be treated as an unscanned text file, so
+    the two are kept deliberately separate and `kind` is typed.
+    """
+
+    path: Path
+    reason: str
+    kind: UnscannedKind
+
+
+LIKELY_TEXT_SUFFIXES = {
+    ".txt", ".md", ".rst", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml",
+    ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".sh", ".bat", ".ps1",
+    ".sql", ".html", ".css", ".xml", ".csv", ".log", ".java", ".cs", ".go",
+    ".rb", ".php", ".rs", ".c", ".h", ".cpp", ".hpp",
+}
+
+KNOWN_BINARY_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff",
+    ".pdf", ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".tar", ".whl", ".exe",
+    ".dll", ".so", ".dylib", ".bin", ".dat", ".mp3", ".mp4", ".mov", ".avi",
+    ".wav", ".flac", ".ttf", ".otf", ".woff", ".woff2", ".pyc", ".pyd", ".class",
+}
+
+
+def classify_unscannable(file_path: Path) -> UnscannedFile | None:
+    """Explain why a file cannot be secret-scanned, or None if it can be.
+
+    Content is sampled *before* size is considered, so a large binary asset is
+    recognised as binary rather than as an oversized text file. Anything not
+    demonstrably binary is treated conservatively as text-like, since that is
+    the classification that blocks a release.
+    """
+    try:
+        size = file_path.stat().st_size
+    except OSError as exc:
+        return UnscannedFile(file_path, f"unreadable: {exc}", UnscannedKind.UNREADABLE)
+
+    try:
+        with file_path.open("rb") as handle:
+            sample = handle.read(8192)
+    except OSError as exc:
+        return UnscannedFile(file_path, f"unreadable: {exc}", UnscannedKind.UNREADABLE)
+
+    suffix = file_path.suffix.lower()
+    if looks_binary(sample) or suffix in KNOWN_BINARY_SUFFIXES:
+        if size > SECRET_SCAN_MAX_BYTES:
+            return UnscannedFile(
+                file_path,
+                f"binary content, {format_bytes(size)} — not scanned by design",
+                UnscannedKind.BINARY,
+            )
+        return UnscannedFile(
+            file_path, "binary content — not scanned by design", UnscannedKind.BINARY
+        )
+
+    if size > SECRET_SCAN_MAX_BYTES:
+        return UnscannedFile(
+            file_path,
+            f"too large: {format_bytes(size)} exceeds the "
+            f"{format_bytes(SECRET_SCAN_MAX_BYTES)} scan limit",
+            UnscannedKind.TEXT_LIKE,
+        )
+
+    try:
+        file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return UnscannedFile(file_path, "not valid UTF-8 text", UnscannedKind.TEXT_LIKE)
+    except OSError as exc:
+        return UnscannedFile(file_path, f"unreadable: {exc}", UnscannedKind.UNREADABLE)
+    return None
+
+
 @dataclass
 class SecretScanResult:
     """Findings plus, just as importantly, what could not be looked at.
@@ -684,7 +795,7 @@ class SecretScanResult:
     """
 
     findings: list[SecretFinding] = field(default_factory=list)
-    unscanned: list[tuple[Path, str]] = field(default_factory=list)
+    unscanned: list[UnscannedFile] = field(default_factory=list)
 
     def __iter__(self):
         # Backwards compatible with callers that treat the result as a list.
@@ -701,46 +812,19 @@ class SecretScanResult:
 
     @property
     def skipped(self) -> list[Path]:
-        return [path for path, _reason in self.unscanned]
+        return [entry.path for entry in self.unscanned]
 
-    def unscanned_text_files(self) -> list[tuple[Path, str]]:
-        """Unscanned files that look like text, i.e. could plausibly hold a key."""
+    def unscanned_text_files(self) -> list[UnscannedFile]:
+        """Unscanned files that could plausibly contain a key.
+
+        Binary assets are excluded: they were never candidates, and blocking a
+        release because it contains a large image helps nobody.
+        """
         return [
-            (path, reason)
-            for path, reason in self.unscanned
-            if path.suffix.lower() in LIKELY_TEXT_SUFFIXES or reason.startswith("too large")
+            entry
+            for entry in self.unscanned
+            if entry.kind in {UnscannedKind.TEXT_LIKE, UnscannedKind.UNREADABLE}
         ]
-
-
-LIKELY_TEXT_SUFFIXES = {
-    ".txt", ".md", ".rst", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml",
-    ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".sh", ".bat", ".ps1",
-    ".sql", ".html", ".css", ".xml", ".csv", ".log", ".java", ".cs", ".go",
-    ".rb", ".php", ".rs", ".c", ".h", ".cpp", ".hpp",
-}
-
-
-def why_unscannable(file_path: Path) -> str | None:
-    """Return a human reason this file cannot be secret-scanned, or None."""
-    try:
-        size = file_path.stat().st_size
-    except OSError as exc:
-        return f"unreadable: {exc}"
-    if size > SECRET_SCAN_MAX_BYTES:
-        return f"too large: {format_bytes(size)} exceeds the {format_bytes(SECRET_SCAN_MAX_BYTES)} scan limit"
-    try:
-        chunk = file_path.open("rb").read(4096)
-    except OSError as exc:
-        return f"unreadable: {exc}"
-    if b"\x00" in chunk:
-        return "binary content"
-    try:
-        file_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return "not valid UTF-8 text"
-    except OSError as exc:
-        return f"unreadable: {exc}"
-    return None
 
 
 def scan_for_secrets(project_dir: Path, files: list[Path]) -> SecretScanResult:
@@ -755,12 +839,16 @@ def scan_for_secrets(project_dir: Path, files: list[Path]) -> SecretScanResult:
     for file_path in files:
         text = read_text_safe(file_path)
         if text is None:
-            reason = why_unscannable(file_path) or "could not be read as text"
+            unscannable = classify_unscannable(file_path) or UnscannedFile(
+                file_path, "could not be read as text", UnscannedKind.TEXT_LIKE
+            )
             try:
                 rel = file_path.relative_to(project_dir)
             except ValueError:
                 rel = file_path
-            result.unscanned.append((rel, reason))
+            result.unscanned.append(
+                UnscannedFile(rel, unscannable.reason, unscannable.kind)
+            )
             continue
         rel_path = file_path.relative_to(project_dir)
 
@@ -1134,6 +1222,8 @@ class CheckReport:
         print(f"\n-- {name} --")
 
 
+CHECK_CONFIG_SCHEMA_VERSION = 1
+
 CONFIG_SCHEMA: dict[str, dict[str, str]] = {
     "version": {"target": "str", "files": "list[str]"},
     "forbidden": {
@@ -1187,7 +1277,24 @@ def validate_check_config(config: dict) -> None:
     plausible-looking failure list. Validate the whole document up front so
     the operator is told the configuration is wrong, not the project.
     """
+    # Optional, for backwards compatibility with configurations written before
+    # the field existed. Declaring it lets a future format change fail closed
+    # on older builds instead of being silently half-interpreted.
+    declared = config.get("schema_version", CHECK_CONFIG_SCHEMA_VERSION)
+    if isinstance(declared, bool) or not isinstance(declared, int):
+        raise ConfigError(f"schema_version must be an integer, got {declared!r}")
+    if declared > CHECK_CONFIG_SCHEMA_VERSION:
+        raise ConfigError(
+            f"schema_version {declared} is newer than this build understands "
+            f"(supports up to {CHECK_CONFIG_SCHEMA_VERSION}). Upgrade "
+            f"{TOOL_NAME}, or lower the declared version."
+        )
+    if declared < 1:
+        raise ConfigError(f"schema_version must be 1 or greater, got {declared}")
+
     for section, value in config.items():
+        if section == "schema_version":
+            continue
         if section not in CONFIG_SCHEMA:
             raise ConfigError(
                 f"unknown section [{section}] — expected one of: "
@@ -1255,7 +1362,9 @@ def read_project_file(project_dir: Path, rel: str) -> str:
     return "\n".join(parts)
 
 
-def run_builtin_checks(project_dir: Path, report: CheckReport) -> None:
+def run_builtin_checks(
+    project_dir: Path, report: CheckReport, *, include_secret_scan: bool = True
+) -> None:
     """Universal checks that apply to any project — no config needed."""
     files = walk_check_tree(project_dir)
 
@@ -1278,27 +1387,30 @@ def run_builtin_checks(project_dir: Path, report: CheckReport) -> None:
         "scripts/ exists (packager excludes it, but consider deleting)",
     )
 
-    # Secret scan.
-    report.section("Secret scan")
-    secret_scan = scan_for_secrets(project_dir, files)
-    findings = secret_scan.findings
-    report.check(
-        "No likely secrets in tracked text files",
-        len(findings) == 0,
-        "; ".join(
-            f"{normalise_rel(f.rel_path)}:{f.line} [{f.label}]" for f in findings[:5]
-        ),
-    )
-
-    if secret_scan.unscanned:
+    # Secret scan. Skipped when packaging: the package stage scans exactly the
+    # files that will ship, so running both gates would ask the same question
+    # twice, of different file sets, and answer with different exit codes.
+    if include_secret_scan:
+        report.section("Secret scan")
+        secret_scan = scan_for_secrets(project_dir, files)
+        findings = secret_scan.findings
         report.check(
-            "All tracked text files could be scanned",
-            len(secret_scan.unscanned_text_files()) == 0,
+            "No likely secrets in tracked text files",
+            len(findings) == 0,
             "; ".join(
-                f"{normalise_rel(rel)} ({reason})"
-                for rel, reason in secret_scan.unscanned_text_files()[:5]
+                f"{normalise_rel(f.rel_path)}:{f.line} [{f.label}]" for f in findings[:5]
             ),
         )
+
+        if secret_scan.unscanned:
+            report.check(
+                "All tracked text files could be scanned",
+                len(secret_scan.unscanned_text_files()) == 0,
+                "; ".join(
+                    f"{normalise_rel(entry.path)} ({entry.reason})"
+                    for entry in secret_scan.unscanned_text_files()[:5]
+                ),
+            )
 
     # Latest package inspection.
     report.section("Latest package")
@@ -1483,6 +1595,13 @@ CHECK_CONFIG_TEMPLATE = """\
 # release_check.toml — per-project rules for `project_packager.py check`.
 # Delete any section you do not need. Built-in checks (debris, secrets,
 # latest-package manifest verification) always run and need no config.
+#
+# Unknown sections and keys are rejected: a misspelled gate that silently does
+# nothing is more dangerous than a stale config that fails visibly.
+
+# Format version. A build that does not understand a newer version refuses the
+# file rather than half-interpreting it.
+schema_version = 1
 
 [version]
 # All listed files must contain the target version string.
@@ -1608,7 +1727,7 @@ def print_summary(
     clean: bool,
     ignore_count: int,
     findings: list[SecretFinding],
-    unscanned: list[tuple[Path, str]] | None = None,
+    unscanned: list[UnscannedFile] | None = None,
     cleaned_dirs: int = 0,
     cleaned_files: int = 0,
     zip_uncompressed_bytes: int = 0,
@@ -1674,8 +1793,9 @@ def print_summary(
     if unscanned:
         print()
         print(f"NOT SCANNED for secrets ({len(unscanned)}) — these ship unexamined:")
-        for rel, reason in unscanned[:20]:
-            print(f"  - {normalise_rel(rel)}  ({reason})")
+        for entry in unscanned[:20]:
+            print(f"  - {normalise_rel(entry.path)}  ({entry.reason})  "
+                  f"[{entry.kind.value}]")
         if len(unscanned) > 20:
             print(f"  ... plus {len(unscanned) - 20} more file(s)")
 
@@ -1693,12 +1813,20 @@ def print_summary(
             else:
                 print("Hash sidecar:            NOT WRITTEN — recipients have "
                       "no trusted hash")
-        if manifest_embedded:
+        if manifest_embedded and sidecar_written:
             print(f"Manifest embedded:       {MANIFEST_ARCNAME}")
-        else:
+        elif manifest_embedded:
+            print(f"Manifest embedded:       {MANIFEST_ARCNAME}")
+            print("Verification:            self-consistency only — no sidecar "
+                  "hash was written")
+        elif sidecar_written:
             print("Manifest embedded:       disabled (--no-manifest)")
             print("Verification:            partial — sidecar hash only, no "
                   "per-file manifest")
+        else:
+            print("Manifest embedded:       disabled (--no-manifest)")
+            print("Verification:            NO VERIFICATION EVIDENCE — no "
+                  "manifest and no sidecar")
 
     if dry_run:
         print()
@@ -1726,7 +1854,15 @@ def open_folder(path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def run_all_checks(project_dir: Path) -> CheckReport:
+def run_all_checks(project_dir: Path, *, include_secret_scan: bool = True) -> CheckReport:
+    """Run the built-in checks, plus any configured in release_check.toml.
+
+    `include_secret_scan` is disabled when packaging: the package stage scans
+    exactly the files that will ship, which is both the honest question and a
+    narrower one than scanning the whole working tree. Running both gates gave
+    two different exit codes for the same problem and could block a release
+    over a secret in a file the release profile excludes anyway.
+    """
     report = CheckReport()
     config = load_check_config(project_dir)
 
@@ -1738,7 +1874,7 @@ def run_all_checks(project_dir: Path) -> CheckReport:
     print(header)
     print("=" * 72)
 
-    run_builtin_checks(project_dir, report)
+    run_builtin_checks(project_dir, report, include_secret_scan=include_secret_scan)
     if config:
         run_config_checks(project_dir, config, report)
     else:
@@ -1818,7 +1954,7 @@ def cmd_package(args: argparse.Namespace) -> int:
 
     if run_checks_first:
         try:
-            report = run_all_checks(project_dir)
+            report = run_all_checks(project_dir, include_secret_scan=False)
         except ConfigError as exc:
             report_config_error(exc)
             return EXIT_BAD_CONFIG
@@ -1838,12 +1974,14 @@ def cmd_package(args: argparse.Namespace) -> int:
     output_zip = output_dir / build_zip_name(project_dir, args.name)
 
     try:
-        ignore_patterns, ignore_count = load_ignore_file(project_dir, strict=strict)
+        ignore_patterns, ignore_count = load_ignore_file(project_dir)
     except ConfigError as exc:
+        # Deliberately not overridable by --force: --force is for judgement
+        # calls about findings, not for proceeding with unusable configuration.
         print(
             f"ERROR: invalid packaging configuration in {IGNORE_FILE_NAME}: {exc}\n"
-            "Strict and release packaging fail closed rather than silently "
-            "dropping every project-specific exclusion.",
+            "Packaging fails closed rather than silently dropping every "
+            "project-specific exclusion. Repair, rename, or remove the file.",
             file=sys.stderr,
         )
         return EXIT_BAD_CONFIG
@@ -1881,6 +2019,27 @@ def cmd_package(args: argparse.Namespace) -> int:
             scan = scan_project(
                 project_dir, rules, output_dir=output_dir, output_zip=output_zip
             )
+
+    # Replacement is not atomic until v3.1.0, so a failed write can destroy a
+    # good archive. Refused where that matters most, unless stated explicitly.
+    if args.overwrite and fail_on_secrets and not args.force:
+        print(
+            "ERROR: --overwrite is refused in strict/release mode because archive "
+            "replacement\nis not yet atomic (scheduled for v3.1.0): a failed write "
+            "can destroy the\nexisting archive. Use a new --name, or accept the "
+            "risk with --force.",
+            file=sys.stderr,
+        )
+        return EXIT_OUTPUT_EXISTS
+
+    if not scan_secrets and fail_on_secrets and not args.force:
+        print(
+            "ERROR: --no-scan disables the secret gate that strict/release mode "
+            "exists to enforce.\nDrop --no-scan, or state the override "
+            "explicitly with --force.",
+            file=sys.stderr,
+        )
+        return EXIT_SECRETS
 
     secret_scan = SecretScanResult()
     if scan_secrets:
@@ -1921,8 +2080,8 @@ def cmd_package(args: argparse.Namespace) -> int:
                 "mode is active:",
                 file=sys.stderr,
             )
-            for rel, reason in blocking_unscanned[:10]:
-                print(f"  - {normalise_rel(rel)} ({reason})", file=sys.stderr)
+            for entry in blocking_unscanned[:10]:
+                print(f"  - {normalise_rel(entry.path)} ({entry.reason})", file=sys.stderr)
             print(
                 "These files ship unexamined. Exclude them, reduce their size, "
                 "or re-run with --force.",
@@ -1974,6 +2133,17 @@ def cmd_package(args: argparse.Namespace) -> int:
         manifest_embedded=not args.no_manifest,
         sidecar_written=sidecar_written,
     )
+
+    # An archive with neither a manifest nor a sidecar carries no evidence
+    # about its own contents at all. That is a failure in any profile.
+    if not sidecar_written and args.no_manifest and not args.dry_run:
+        print(
+            "ERROR: this archive has no embedded manifest and no hash sidecar, "
+            "so nothing\ncan ever be verified about its contents. "
+            "Fix the output location and re-run.",
+            file=sys.stderr,
+        )
+        return EXIT_OS_ERROR
 
     # A release with no sidecar has no trusted hash for its recipient to check
     # against, which removes the point of shipping it as a verified artifact.

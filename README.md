@@ -31,6 +31,24 @@ Project Packager runs the release checklist for you, produces a clean archive, e
 
 **Backward compatible:** `python project_packager.py .` (no subcommand) still packages.
 
+## Current limitations
+
+Please read these before relying on the tool for anything important.
+
+- **Archive replacement is not atomic.** A failed write can leave a partial file,
+  and `--overwrite` can destroy a valid previous archive before its replacement
+  succeeds. For that reason `--overwrite` is refused in strict/release mode
+  unless you add `--force`. Atomic replacement is scheduled for v3.1.0.
+- **`--clean` is not fully hardened.** It removes only approved cache names and
+  will not follow a symlink, but it does not yet re-verify containment
+  immediately before each deletion. Release mode enables cleaning automatically.
+- **`verify` is not a hostile-archive verifier.** It does not yet reject
+  duplicate members, unsafe member paths, or malformed manifest structure, and
+  it reads members whole rather than streaming them. Treat it as a corruption
+  and accident detector, not a defence against a crafted archive.
+- **Secret scanning is heuristic and cannot prove a project is secret-free.**
+  See the note at the end of the next section.
+
 ## What verification does and does not show
 
 Project Packager provides **integrity checking**, not authenticated signing. The
@@ -40,8 +58,8 @@ It does show:
 
 - **Corruption detection.** A truncated download, a bad disk, or a partial copy
   changes hashes and is caught.
-- **Self-consistency.** Archive members match the manifest embedded alongside
-  them, so nothing was added, removed, or altered *after* packaging.
+- **Self-consistency.** Archive members currently match the manifest embedded in
+  that same archive.
 - **Tamper evidence relative to a trusted hash.** If you obtained the expected
   SHA-256 through a channel you trust — a signed release page, a message from
   the author, your own records — a match shows you have that exact archive.
@@ -58,10 +76,36 @@ For origin and substitution resistance you need detached signatures — Minisign
 GPG, or Sigstore. That may be offered as an optional feature later; it is not
 part of the ordinary workflow today.
 
+### `--no-scan` and unscanned files
+
+`--no-scan` disables secret scanning entirely. In strict or release mode it must
+be paired with `--force`, because silently disabling the gate that those modes
+exist to enforce is a trap rather than a convenience.
+
+Files the scanner cannot read are reported rather than skipped quietly, and are
+classified by content, not size:
+
+- **Binary assets** — images, PDFs, wheels, media — are recorded as
+  intentionally unscanned and do not block a release.
+- **Text files it could not read** — over the 1 MiB limit, not valid UTF-8, or
+  unreadable — block strict and release packaging unless you add `--force`,
+  because they ship unexamined.
+
 Likewise, the secret scanner is heuristic. It detects known token shapes in
 files it can read, reports files it could not scan, and blocks release mode on
 both. It cannot prove a project is secret-free, and it supplements rather than
 replaces provider-side secret revocation, repository scanning, and human review.
+
+### Configuration format version
+
+`release_check.toml` may declare `schema_version = 1` at the top level. It is
+optional, so existing files keep working, but declaring it means a future
+release that changes field meanings will be refused by an older build rather
+than half-interpreted. `init` writes it by default.
+
+Unknown sections and keys are rejected outright. A misspelled gate such as
+`[requred]` that silently does nothing is more dangerous than a stale
+configuration that fails visibly.
 
 ## Requirements
 
@@ -235,7 +279,8 @@ The manifest can also be inspected or verified with standard tools — it's plai
 | 6    | Pre-package release checks failed (`--force` to override)      |
 | 7    | Archive verified only partially (valid sidecar, no manifest)   |
 | 8    | Project file collides with a reserved internal name            |
-| 9    | `release_check.toml` unreadable, malformed, or invalid         |
+| 9    | `release_check.toml` or `.packagerignore` present but unusable |
+| 10   | A source path escaped the project between scanning and writing |
 
 ## What `--clean` will and won't touch
 

@@ -384,3 +384,77 @@ def test_sidecar_failure_fails_release_mode(
          "--output", str(out_dir), "--name", "rel"]
     )
     assert code != 0
+
+
+def test_no_manifest_and_no_sidecar_fails_the_package(
+    demo_project: Path, out_dir: Path, monkeypatch
+) -> None:
+    """An archive with neither carries no verification evidence at all."""
+    original_write_text = Path.write_text
+
+    def refuse_sidecar(self, *args, **kwargs):
+        if self.name.endswith(".sha256"):
+            raise OSError("simulated sidecar write failure")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", refuse_sidecar)
+    code = pkg.main(
+        ["package", str(demo_project), "--output", str(out_dir),
+         "--name", "demo", "--no-manifest"]
+    )
+    assert code != 0
+
+
+def test_no_manifest_summary_reflects_sidecar_failure(
+    demo_project: Path, out_dir: Path, monkeypatch, capsys
+) -> None:
+    original_write_text = Path.write_text
+
+    def refuse_sidecar(self, *args, **kwargs):
+        if self.name.endswith(".sha256"):
+            raise OSError("simulated sidecar write failure")
+        return original_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", refuse_sidecar)
+    pkg.main(
+        ["package", str(demo_project), "--output", str(out_dir),
+         "--name", "demo", "--no-manifest"]
+    )
+    output = capsys.readouterr().out.lower()
+    assert "sidecar hash only" not in output, "claimed partial verification with no sidecar"
+    assert "no verification evidence" in output
+
+
+def test_overwrite_is_refused_in_release_mode_until_atomic(
+    clean_project: Path, out_dir: Path
+) -> None:
+    """Replacement is not atomic yet, so --overwrite can destroy a good archive.
+
+    Refused in strict/release, where that matters most, until v3.1.0 lands
+    atomic replacement. Overridable with --force.
+    """
+    (out_dir / pkg.build_zip_name(clean_project, "rel")).write_bytes(b"previous release")
+
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release", "--output", str(out_dir),
+         "--name", "rel", "--overwrite"]
+    )
+    assert code != 0
+    assert (out_dir / pkg.build_zip_name(clean_project, "rel")).read_bytes() == b"previous release"
+
+
+def test_overwrite_in_release_is_permitted_with_force(clean_project: Path, out_dir: Path) -> None:
+    (out_dir / pkg.build_zip_name(clean_project, "rel")).write_bytes(b"previous release")
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release", "--output", str(out_dir),
+         "--name", "rel", "--overwrite", "--force"]
+    )
+    assert code == 0
+
+
+def test_overwrite_still_works_in_share_mode(demo_project: Path, out_dir: Path) -> None:
+    (out_dir / pkg.build_zip_name(demo_project, "demo")).write_bytes(b"previous")
+    code = pkg.main(
+        ["package", str(demo_project), "--output", str(out_dir), "--name", "demo", "--overwrite"]
+    )
+    assert code == 0
