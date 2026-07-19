@@ -2,14 +2,14 @@
 
 A small, safe, audit-friendly project packaging and release-checking CLI.
 
-Check a project against universal and per-project release rules, package it into a clean **verifiable** ZIP with an embedded SHA-256 manifest, and later prove the archive hasn't been tampered with — all from one file.
+Check a project against universal and per-project release rules, package it into a clean **verifiable** ZIP with an embedded SHA-256 manifest, and later check that archive against the hash it was distributed with — all from one file.
 
 **Standard library only. Single file. No dependencies. Windows-friendly.**
 
 ```
 python project_packager.py check .                       # release sanity checks
 python project_packager.py package . --profile release   # gated, verified build
-python project_packager.py verify mypkg_2026-07-03.zip   # prove it's intact
+python project_packager.py verify mypkg_2026-07-03.zip   # check it against its hash
 ```
 
 ---
@@ -18,7 +18,7 @@ python project_packager.py verify mypkg_2026-07-03.zip   # prove it's intact
 
 Zipping a project folder by hand ships everything: `__pycache__`, `.git`, virtualenvs, old ZIPs nested inside new ZIPs, `.bak` debris, stray patch scripts — and occasionally an API key. And even a clean-looking ZIP can hide stale files, wrong version banners, or forgotten internal hostnames.
 
-Project Packager runs the release checklist for you, produces a clean archive, embeds cryptographic proof of exactly what's inside it, and refuses to ship secrets or failed checks in release mode.
+Project Packager runs the release checklist for you, produces a clean archive, embeds a per-file SHA-256 record of exactly what's inside it, and blocks failed checks and detected secrets in release mode.
 
 ## The pipeline
 
@@ -27,9 +27,41 @@ Project Packager runs the release checklist for you, produces a clean archive, e
 | `init`    | Drop starter `release_check.toml` + `.packagerignore` into a project     |
 | `check`   | Universal checks + your per-project rules; exit 0/1                      |
 | `package` | Clean ZIP with embedded SHA-256 manifest + `.sha256` sidecar             |
-| `verify`  | Re-hash every archive member against the manifest; detect any tampering  |
+| `verify`  | Re-hash every archive member against the manifest; detect corruption     |
 
 **Backward compatible:** `python project_packager.py .` (no subcommand) still packages.
+
+## What verification does and does not show
+
+Project Packager provides **integrity checking**, not authenticated signing. The
+distinction matters when you decide how much to rely on a `verify` result.
+
+It does show:
+
+- **Corruption detection.** A truncated download, a bad disk, or a partial copy
+  changes hashes and is caught.
+- **Self-consistency.** Archive members match the manifest embedded alongside
+  them, so nothing was added, removed, or altered *after* packaging.
+- **Tamper evidence relative to a trusted hash.** If you obtained the expected
+  SHA-256 through a channel you trust — a signed release page, a message from
+  the author, your own records — a match shows you have that exact archive.
+
+It does not show:
+
+- **Authorship or origin.** Nothing here proves who built the archive.
+- **Resistance to a substituting attacker.** Anyone who can replace the ZIP can
+  also replace its `.sha256` sidecar and rewrite the embedded manifest to match.
+  Verification against a hash you fetched from the same place as the archive
+  proves only that the two agree with each other.
+
+For origin and substitution resistance you need detached signatures — Minisign,
+GPG, or Sigstore. That may be offered as an optional feature later; it is not
+part of the ordinary workflow today.
+
+Likewise, the secret scanner is heuristic. It detects known token shapes in
+files it can read, reports files it could not scan, and blocks release mode on
+both. It cannot prove a project is secret-free, and it supplements rather than
+replaces provider-side secret revocation, repository scanning, and human review.
 
 ## Requirements
 
@@ -178,7 +210,7 @@ Trailing `/` marks a directory pattern; patterns containing `/` match against th
 
 ---
 
-## `verify` — prove an archive is intact
+## `verify` — check an archive against its manifest and hash
 
 ```bash
 python project_packager.py verify packaged\myproject_2026-07-03_1430.zip
@@ -201,6 +233,9 @@ The manifest can also be inspected or verified with standard tools — it's plai
 | 4    | OS error while writing                                         |
 | 5    | Secrets found in strict/release mode (`--force` to override)   |
 | 6    | Pre-package release checks failed (`--force` to override)      |
+| 7    | Archive verified only partially (valid sidecar, no manifest)   |
+| 8    | Project file collides with a reserved internal name            |
+| 9    | `release_check.toml` unreadable, malformed, or invalid         |
 
 ## What `--clean` will and won't touch
 

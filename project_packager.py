@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-project_packager.py — v3.0.0
+project_packager.py
 
 A small, safe, audit-friendly project packaging and release-checking CLI.
+Version is defined once, in TOOL_VERSION below; run with --version to see it.
 
 Copyright 2026 Leon Priest / 7h3v01d
 Licensed under the Apache License, Version 2.0.
@@ -18,6 +19,13 @@ Backward compatible: `python project_packager.py .` still packages.
 Packaging (see `package --help`):
     - Never deletes or modifies your project (unless --clean, which removes
       only disposable cache junk).
+    - Never follows symlinks. Symlinked files and directories are skipped and
+      reported, so a link cannot smuggle material from outside the project
+      into the archive. --include cannot override this.
+    - Never packages the archive it is writing, its sidecar, or its temporary
+      forms, even when --output is the project root itself.
+    - Reserves PACKAGE_MANIFEST.json for its own metadata and refuses to
+      package a project that already contains a file of that name.
     - Excludes caches, VCS folders, virtualenvs, build output, session
       debris, and existing *.zip files.
     - Embeds PACKAGE_MANIFEST.json (per-file SHA-256 + sizes) in the ZIP
@@ -57,11 +65,44 @@ from pathlib import Path
 from typing import Iterable
 
 TOOL_NAME = "project_packager"
-TOOL_VERSION = "3.0.0"
+TOOL_VERSION = "3.0.1"
 
 MANIFEST_ARCNAME = "PACKAGE_MANIFEST.json"
 CHECK_CONFIG_NAME = "release_check.toml"
 IGNORE_FILE_NAME = ".packagerignore"
+
+# --------------------------------------------------------------------------
+# Exit codes
+# --------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_PROBLEMS = 1          # check failures / verification problems
+EXIT_BAD_PROJECT = 2       # project path missing or not a directory
+EXIT_OUTPUT_EXISTS = 3     # output ZIP already exists (use --overwrite)
+EXIT_OS_ERROR = 4          # OS error while writing
+EXIT_SECRETS = 5           # secrets found in strict/release mode
+EXIT_CHECKS_FAILED = 6     # pre-package release checks failed
+EXIT_PARTIAL = 7           # sidecar valid but no embedded manifest to verify
+EXIT_RESERVED_NAME = 8     # project file collides with reserved internal name
+EXIT_BAD_CONFIG = 9        # release_check.toml or .packagerignore present but
+                           # unreadable, malformed, or structurally invalid
+EXIT_CONTAINMENT = 10      # a source path escaped the project between scan and write
+
+
+class ConfigError(Exception):
+    """release_check.toml exists but cannot be trusted.
+
+    Deliberately distinct from "no configuration": a broken release gate must
+    never be mistaken for an absent one.
+    """
+
+
+class ReservedNameError(Exception):
+    """A project file collides with a name the packager reserves internally."""
+
+
+class ContainmentError(Exception):
+    """A source path escaped the project root between scanning and writing."""
 
 # --------------------------------------------------------------------------
 # Exclusion rule data
@@ -224,6 +265,7 @@ class ScanResult:
     clean_dirs: list[Path] = field(default_factory=list)
     clean_files: list[Path] = field(default_factory=list)
     force_included: list[Path] = field(default_factory=list)
+    skipped_symlinks: list[Decision] = field(default_factory=list)
 
 
 @dataclass
@@ -268,6 +310,15 @@ def matches_path_pattern(rel_posix: str, patterns: Iterable[str]) -> str | None:
     return None
 
 
+def normalise_pattern(pattern: str) -> str:
+    """Accept Windows-style patterns without surprising Windows users.
+
+    Rules are matched against POSIX-style relative paths, so a pattern typed
+    as `large_data\\data.csv` must mean the same thing as `large_data/data.csv`.
+    """
+    return pattern.replace("\\", "/").strip()
+
+
 def is_force_included(file_name: str, rel_posix: str, rules: Rules) -> str | None:
     """Return the matching --include pattern, or None."""
     for pattern in rules.include_patterns:
@@ -275,6 +326,28 @@ def is_force_included(file_name: str, rel_posix: str, rules: Rules) -> str | Non
             if matches_path_pattern(rel_posix, [pattern]):
                 return pattern
         elif fnmatch.fnmatch(file_name, pattern):
+            return pattern
+    return None
+
+
+def include_may_reopen_dir(rel_posix: str, rules: Rules) -> str | None:
+    """Return an include pattern that needs this directory kept open, or None.
+
+    P0 #4: `--include ".vscode/settings.json"` cannot work if `.vscode` is
+    pruned before the file loop ever sees it. Only path-style patterns reopen
+    a directory, and only along their own literal prefix — a bare name pattern
+    such as `*.zip` must not drag every excluded tree back into the archive.
+    """
+    prefix = rel_posix.rstrip("/") + "/"
+    for pattern in rules.include_patterns:
+        if "/" not in pattern:
+            continue
+        clean = pattern.rstrip("/")
+        if clean.startswith(prefix) or fnmatch.fnmatch(prefix.rstrip("/"), clean):
+            return pattern
+        # A wildcard segment ("docs/*/notes.md") can still target this branch.
+        head = clean.split("/")[0]
+        if ("*" in head or "?" in head) and fnmatch.fnmatch(rel_posix.split("/")[0], head):
             return pattern
     return None
 
@@ -322,17 +395,34 @@ def should_exclude_file(file_name: str, rel_posix: str, rules: Rules) -> str | N
 # --------------------------------------------------------------------------
 
 
-def load_ignore_file(project_dir: Path) -> tuple[list[str], int]:
-    """Load .packagerignore patterns. Returns (patterns, count)."""
+def load_ignore_file(project_dir: Path, *, strict: bool = False) -> tuple[list[str], int]:
+    """Load .packagerignore patterns. Returns (patterns, count).
+
+    A file that exists but cannot be read means every project-specific
+    exclusion is silently lost. In strict/release mode that fails closed with
+    ConfigError; for ordinary sharing it warns loudly and continues.
+    """
     ignore_path = project_dir / IGNORE_FILE_NAME
+    if not ignore_path.exists():
+        return [], 0
     if not ignore_path.is_file():
+        message = f"{IGNORE_FILE_NAME} exists but is not a regular file"
+        if strict:
+            raise ConfigError(message)
+        print(f"WARNING: {message} — no project exclusions loaded", file=sys.stderr)
         return [], 0
 
     patterns: list[str] = []
     try:
         text = ignore_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        print(f"WARNING: could not read {IGNORE_FILE_NAME}: {exc}", file=sys.stderr)
+        message = f"could not read {IGNORE_FILE_NAME}: {exc}"
+        if strict:
+            raise ConfigError(message) from exc
+        print(
+            f"WARNING: {message} — no project exclusions loaded",
+            file=sys.stderr,
+        )
         return [], 0
 
     for raw_line in text.splitlines():
@@ -368,7 +458,10 @@ def build_rules(
         for pattern in STRICT_EXCLUDE_FILE_PATTERNS:
             (rules.path_patterns if "/" in pattern else rules.file_patterns).add(pattern)
 
-    for pattern in ignore_patterns + list(extra_excludes):
+    for raw_pattern in ignore_patterns + list(extra_excludes):
+        pattern = normalise_pattern(raw_pattern)
+        if not pattern:
+            continue
         if pattern.endswith("/"):
             clean = pattern.rstrip("/")
             if "/" in clean:
@@ -381,7 +474,9 @@ def build_rules(
             rules.file_patterns.add(pattern)
             rules.dir_patterns.add(pattern)
 
-    rules.include_patterns |= set(include_patterns)
+    rules.include_patterns |= {
+        normalise_pattern(p) for p in include_patterns if normalise_pattern(p)
+    }
     return rules
 
 
@@ -390,26 +485,70 @@ def build_rules(
 # --------------------------------------------------------------------------
 
 
+def reserved_output_paths(output_zip: Path | None) -> set[Path]:
+    """Paths the packager is about to write, which it must never archive.
+
+    Kept separate from ordinary exclusions because --include must not be able
+    to reach them: an archive that contains itself is never what was meant.
+    """
+    if output_zip is None:
+        return set()
+    resolved = output_zip.resolve()
+    return {
+        resolved,
+        resolved.with_name(resolved.name + ".sha256"),
+        resolved.with_name(resolved.name + ".part"),
+        resolved.with_name(resolved.name + ".tmp"),
+    }
+
+
 def scan_project(
     project_dir: Path,
     rules: Rules,
     *,
     output_dir: Path | None = None,
+    output_zip: Path | None = None,
 ) -> ScanResult:
     """Scan the project and decide what gets included/excluded.
 
-    output_dir is excluded if it sits inside the project, so the package
-    output folder does not get accidentally included.
+    Safety restrictions that --include cannot override:
+      - symlinked files and directories are never followed;
+      - the archive being written, its sidecar, and its temporary forms are
+        never packaged.
+
+    A separate output *directory* inside the project is still pruned whole,
+    but when the output directory is the project root itself only the exact
+    output files are excluded — pruning the root would produce an archive
+    containing nothing but a manifest.
     """
     result = ScanResult()
     project_dir = project_dir.resolve()
     resolved_output_dir = output_dir.resolve() if output_dir else None
+    reserved = reserved_output_paths(output_zip)
+
+    # Only prune a *separate* output subdirectory. output_dir == project_dir
+    # is the `--output .` case and must not remove the project from itself.
+    prune_output_dir = (
+        resolved_output_dir is not None and resolved_output_dir != project_dir
+    )
+
+    # Directories that an --include reopened: kept open so the wanted file can
+    # be reached, but everything else beneath them stays excluded.
+    reopened: dict[Path, str] = {}
+
+    def inherited_exclusion(path: Path) -> str | None:
+        current = path
+        while True:
+            if current in reopened:
+                return reopened[current]
+            if current == project_dir or current.parent == current:
+                return None
+            current = current.parent
 
     for root, dirs, files in os.walk(project_dir):
         root_path = Path(root)
 
-        # If output dir is inside the project, avoid including it.
-        if resolved_output_dir and is_inside(root_path, resolved_output_dir):
+        if prune_output_dir and is_inside(root_path, resolved_output_dir):
             try:
                 rel = root_path.relative_to(project_dir)
             except ValueError:
@@ -420,6 +559,8 @@ def scan_project(
             dirs[:] = []
             continue
 
+        suppressed = inherited_exclusion(root_path)
+
         # Mutate dirs in-place so os.walk does not descend into excluded folders.
         kept_dirs: list[str] = []
         for dir_name in sorted(dirs):
@@ -427,11 +568,27 @@ def scan_project(
             rel_path = dir_path.relative_to(project_dir)
             rel_posix = normalise_rel(rel_path)
 
+            # Non-overridable: never follow a symlinked directory. os.walk does
+            # not descend into one by default, but it would still be reported
+            # as an ordinary directory, and its files would be archived.
+            if dir_path.is_symlink():
+                result.skipped_symlinks.append(
+                    Decision(dir_path, rel_path, "symlink directory skipped")
+                )
+                continue
+
             if dir_name in CLEAN_DIR_NAMES:
                 result.clean_dirs.append(dir_path)
 
             reason = should_exclude_dir(dir_name, rel_posix, rules)
             if reason:
+                reopen_hit = include_may_reopen_dir(rel_posix, rules)
+                if reopen_hit:
+                    # Keep walking, but remember that everything inside is
+                    # excluded unless it is itself force-included.
+                    reopened[dir_path] = reason
+                    kept_dirs.append(dir_name)
+                    continue
                 result.excluded.append(Decision(dir_path, rel_path, reason))
             else:
                 kept_dirs.append(dir_name)
@@ -443,6 +600,22 @@ def scan_project(
             rel_path = file_path.relative_to(project_dir)
             rel_posix = normalise_rel(rel_path)
 
+            # Non-overridable: never follow a symlinked file. Checked before
+            # --include so a link cannot be forced into the archive, and before
+            # clean collection so cleaning cannot follow one either.
+            if file_path.is_symlink():
+                result.skipped_symlinks.append(
+                    Decision(file_path, rel_path, "symlink file skipped")
+                )
+                continue
+
+            # Non-overridable: never archive the output we are about to write.
+            if reserved and file_path.resolve() in reserved:
+                result.excluded.append(
+                    Decision(file_path, rel_path, "reserved output file")
+                )
+                continue
+
             if matches_any_pattern(file_name, CLEAN_FILE_PATTERNS):
                 result.clean_files.append(file_path)
 
@@ -450,6 +623,10 @@ def scan_project(
             if include_hit:
                 result.included_files.append(file_path)
                 result.force_included.append(file_path)
+                continue
+
+            if suppressed:
+                result.excluded.append(Decision(file_path, rel_path, suppressed))
                 continue
 
             reason = should_exclude_file(file_name, rel_posix, rules)
@@ -497,13 +674,93 @@ def read_text_safe(path: Path, limit: int = SECRET_SCAN_MAX_BYTES) -> str | None
     return data.decode("utf-8", errors="ignore")
 
 
-def scan_for_secrets(project_dir: Path, files: list[Path]) -> list[SecretFinding]:
-    """Scan text files for likely secrets. Read-only, best-effort."""
-    findings: list[SecretFinding] = []
+@dataclass
+class SecretScanResult:
+    """Findings plus, just as importantly, what could not be looked at.
+
+    A scanner that silently drops files it cannot read reports "no secrets"
+    when it means "no secrets in the part I read". Release mode needs to know
+    the difference.
+    """
+
+    findings: list[SecretFinding] = field(default_factory=list)
+    unscanned: list[tuple[Path, str]] = field(default_factory=list)
+
+    def __iter__(self):
+        # Backwards compatible with callers that treat the result as a list.
+        return iter(self.findings)
+
+    def __len__(self) -> int:
+        return len(self.findings)
+
+    def __getitem__(self, index):
+        return self.findings[index]
+
+    def __bool__(self) -> bool:
+        return bool(self.findings)
+
+    @property
+    def skipped(self) -> list[Path]:
+        return [path for path, _reason in self.unscanned]
+
+    def unscanned_text_files(self) -> list[tuple[Path, str]]:
+        """Unscanned files that look like text, i.e. could plausibly hold a key."""
+        return [
+            (path, reason)
+            for path, reason in self.unscanned
+            if path.suffix.lower() in LIKELY_TEXT_SUFFIXES or reason.startswith("too large")
+        ]
+
+
+LIKELY_TEXT_SUFFIXES = {
+    ".txt", ".md", ".rst", ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".yaml",
+    ".yml", ".toml", ".ini", ".cfg", ".conf", ".env", ".sh", ".bat", ".ps1",
+    ".sql", ".html", ".css", ".xml", ".csv", ".log", ".java", ".cs", ".go",
+    ".rb", ".php", ".rs", ".c", ".h", ".cpp", ".hpp",
+}
+
+
+def why_unscannable(file_path: Path) -> str | None:
+    """Return a human reason this file cannot be secret-scanned, or None."""
+    try:
+        size = file_path.stat().st_size
+    except OSError as exc:
+        return f"unreadable: {exc}"
+    if size > SECRET_SCAN_MAX_BYTES:
+        return f"too large: {format_bytes(size)} exceeds the {format_bytes(SECRET_SCAN_MAX_BYTES)} scan limit"
+    try:
+        chunk = file_path.open("rb").read(4096)
+    except OSError as exc:
+        return f"unreadable: {exc}"
+    if b"\x00" in chunk:
+        return "binary content"
+    try:
+        file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return "not valid UTF-8 text"
+    except OSError as exc:
+        return f"unreadable: {exc}"
+    return None
+
+
+def scan_for_secrets(project_dir: Path, files: list[Path]) -> SecretScanResult:
+    """Scan text files for likely secrets. Read-only, best-effort.
+
+    Heuristic by nature: it detects known token shapes in files it can read.
+    It cannot prove a project is secret-free, so everything it could not read
+    is recorded rather than dropped.
+    """
+    result = SecretScanResult()
 
     for file_path in files:
         text = read_text_safe(file_path)
         if text is None:
+            reason = why_unscannable(file_path) or "could not be read as text"
+            try:
+                rel = file_path.relative_to(project_dir)
+            except ValueError:
+                rel = file_path
+            result.unscanned.append((rel, reason))
             continue
         rel_path = file_path.relative_to(project_dir)
 
@@ -512,9 +769,9 @@ def scan_for_secrets(project_dir: Path, files: list[Path]) -> list[SecretFinding
                 line = text.count("\n", 0, match.start()) + 1
                 token = match.group(0)
                 preview = token[:10] + "..." if len(token) > 10 else token
-                findings.append(SecretFinding(rel_path, line, label, preview))
+                result.findings.append(SecretFinding(rel_path, line, label, preview))
 
-    return findings
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +860,42 @@ def build_zip_name(project_dir: Path, custom_name: str | None) -> str:
     return f"{safe_base}_{timestamp}.zip"
 
 
+def assert_no_reserved_collision(project_dir: Path, included_files: list[Path]) -> None:
+    """P0 #5: refuse to package a project that ships its own manifest name.
+
+    Silently dropping the user's file would lose material; writing both
+    produces two members with the same name, and the resulting archive fails
+    its own verification. Neither is acceptable, so the run stops instead.
+    """
+    for file_path in included_files:
+        if normalise_rel(file_path.relative_to(project_dir)) == MANIFEST_ARCNAME:
+            raise ReservedNameError(
+                f"{MANIFEST_ARCNAME} is reserved for the packager's own metadata, "
+                f"but the project contains a file of that name.\n"
+                f"This applies with --no-manifest too: verify would read the "
+                f"project's file as the internal manifest.\n"
+                f"Rename it, or exclude it with --exclude \"{MANIFEST_ARCNAME}\"."
+            )
+
+
+def assert_contained(project_dir: Path, file_path: Path) -> None:
+    """Recheck a source immediately before it is written into the archive.
+
+    Scanning and writing are separate passes, so a path that was safe when
+    scanned may not be safe by the time it is read.
+    """
+    if file_path.is_symlink():
+        raise ContainmentError(f"refusing to archive a symlink: {file_path}")
+    try:
+        resolved = file_path.resolve(strict=True)
+    except OSError as exc:
+        raise ContainmentError(f"could not resolve {file_path}: {exc}") from exc
+    if not is_inside(resolved, project_dir):
+        raise ContainmentError(
+            f"refusing to archive a path outside the project: {file_path} -> {resolved}"
+        )
+
+
 def create_zip(
     project_dir: Path,
     included_files: list[Path],
@@ -610,43 +903,84 @@ def create_zip(
     *,
     overwrite: bool,
     manifest: dict | None,
-) -> tuple[int, str]:
-    """Create the ZIP. Returns (total uncompressed bytes, zip sha256)."""
+) -> tuple[int, str, bool]:
+    """Create the ZIP.
+
+    Returns (total uncompressed bytes, zip sha256, sidecar written).
+    """
     if output_zip.exists() and not overwrite:
         raise FileExistsError(
             f"Output already exists: {output_zip}\n"
             "Use --overwrite or choose a different --name/--output."
         )
 
+    # Unconditional: the name belongs to the verification protocol, not to the
+    # manifest-writing path. With --no-manifest a project's own file of that
+    # name would otherwise be archived and later mistaken for the internal one.
+    assert_no_reserved_collision(project_dir, included_files)
+
     output_zip.parent.mkdir(parents=True, exist_ok=True)
 
     total_bytes = 0
+    try:
+        total_bytes = _write_members(project_dir, included_files, output_zip, manifest)
+    except (ReservedNameError, ContainmentError):
+        # Full atomic replacement lands in v3.1.0. Until then, at least do not
+        # leave a partial archive behind for the failures introduced here.
+        try:
+            output_zip.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+    zip_digest = sha256_of_file(output_zip)
+
+    # Sidecar hash file: "<hash>  <filename>" (sha256sum-compatible).
+    sidecar = output_zip.with_name(output_zip.name + ".sha256")
+    sidecar_written = True
+    try:
+        sidecar.write_text(f"{zip_digest}  {output_zip.name}\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"WARNING: could not write hash sidecar: {exc}", file=sys.stderr)
+        sidecar_written = False
+
+    return total_bytes, zip_digest, sidecar_written
+
+
+def _write_members(
+    project_dir: Path,
+    included_files: list[Path],
+    output_zip: Path,
+    manifest: dict | None,
+) -> int:
+    """Write every member into the archive. Returns uncompressed byte total."""
+    total_bytes = 0
     with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        written: set[str] = set()
         for file_path in sorted(included_files):
             rel_path = file_path.relative_to(project_dir)
             arcname = normalise_rel(rel_path)
+            if arcname in written:
+                raise ReservedNameError(f"duplicate archive member: {arcname}")
+            assert_contained(project_dir, file_path)
             zf.write(file_path, arcname)
+            written.add(arcname)
             try:
                 total_bytes += file_path.stat().st_size
             except OSError:
                 pass
 
         if manifest is not None:
+            if MANIFEST_ARCNAME in written:
+                raise ReservedNameError(
+                    f"{MANIFEST_ARCNAME} is reserved for the packager's own metadata."
+                )
             zf.writestr(
                 MANIFEST_ARCNAME,
                 json.dumps(manifest, indent=2, sort_keys=False),
             )
 
-    zip_digest = sha256_of_file(output_zip)
-
-    # Sidecar hash file: "<hash>  <filename>" (sha256sum-compatible).
-    sidecar = output_zip.with_name(output_zip.name + ".sha256")
-    try:
-        sidecar.write_text(f"{zip_digest}  {output_zip.name}\n", encoding="utf-8")
-    except OSError as exc:
-        print(f"WARNING: could not write hash sidecar: {exc}", file=sys.stderr)
-
-    return total_bytes, zip_digest
+    return total_bytes
 
 
 # --------------------------------------------------------------------------
@@ -655,15 +989,25 @@ def create_zip(
 
 
 def verify_archive(zip_path: Path) -> int:
-    """Verify a ZIP against its embedded manifest and .sha256 sidecar.
+    """Check a ZIP against its embedded manifest and .sha256 sidecar.
 
-    Returns 0 if everything checks out, 1 otherwise.
+    Tracks *positive evidence*, not merely the absence of detected failures.
+    An archive with no trusted hash and no manifest has been checked against
+    nothing at all, and saying so is the only honest result.
+
+    Returns:
+        0  every available check passed
+        1  a check failed, or nothing could be checked
+        7  partial: the sidecar matched, but there is no manifest to check
+           the contents against
     """
     if not zip_path.is_file():
         print(f"ERROR: not a file: {zip_path}", file=sys.stderr)
-        return 1
+        return EXIT_PROBLEMS
 
     failures = 0
+    sidecar_verified = False   # a trusted hash matched the archive as a whole
+    manifest_verified = False  # contents matched the archive's own manifest
     print()
     print(f"Verifying: {zip_path.name}")
 
@@ -675,6 +1019,7 @@ def verify_archive(zip_path: Path) -> int:
             actual = sha256_of_file(zip_path)
             if expected == actual:
                 print(f"  OK    sidecar hash matches ({actual[:16]}...)")
+                sidecar_verified = True
             else:
                 print(f"  FAIL  sidecar hash mismatch")
                 print(f"        expected {expected}")
@@ -690,8 +1035,23 @@ def verify_archive(zip_path: Path) -> int:
         with zipfile.ZipFile(zip_path) as zf:
             names = set(zf.namelist())
             if MANIFEST_ARCNAME not in names:
-                print(f"  WARN  no {MANIFEST_ARCNAME} embedded — nothing more to verify")
-                return 1 if failures else 0
+                print(f"  WARN  no {MANIFEST_ARCNAME} embedded")
+                print()
+                if failures:
+                    print(f"RESULT: FAIL — {failures} problem(s) found.")
+                    return EXIT_PROBLEMS
+                if not sidecar_verified:
+                    print("RESULT: FAIL — nothing could be checked.")
+                    print("        No trusted sidecar hash and no embedded "
+                          "manifest: this archive")
+                    print("        carries no evidence about its own contents.")
+                    return EXIT_PROBLEMS
+                print("RESULT: PARTIAL — the sidecar hash matched, so the archive "
+                      "matches the")
+                print("        hash it was distributed with, but it contains no "
+                      "manifest to")
+                print("        check its individual members against.")
+                return EXIT_PARTIAL
 
             manifest = json.loads(zf.read(MANIFEST_ARCNAME))
             entries = manifest.get("files", [])
@@ -720,6 +1080,8 @@ def verify_archive(zip_path: Path) -> int:
                 failures += 1
 
             print(f"  {ok_count}/{len(entries)} file hashes verified")
+            if not failures:
+                manifest_verified = True
     except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
         print(f"  FAIL  could not verify archive: {exc}")
         failures += 1
@@ -727,9 +1089,18 @@ def verify_archive(zip_path: Path) -> int:
     print()
     if failures:
         print(f"RESULT: FAIL — {failures} problem(s) found.")
-        return 1
-    print("RESULT: OK — archive verified.")
-    return 0
+        return EXIT_PROBLEMS
+    if not (sidecar_verified or manifest_verified):
+        print("RESULT: FAIL — nothing could be checked.")
+        return EXIT_PROBLEMS
+    if manifest_verified and not sidecar_verified:
+        print("RESULT: OK — archive is internally consistent with its own manifest.")
+        print("        No trusted sidecar hash was available, so this shows the "
+              "archive is")
+        print("        self-consistent, not that it is the archive you were sent.")
+        return EXIT_OK
+    print("RESULT: OK — archive verified against its sidecar hash and manifest.")
+    return EXIT_OK
 
 
 # --------------------------------------------------------------------------
@@ -763,25 +1134,111 @@ class CheckReport:
         print(f"\n-- {name} --")
 
 
+CONFIG_SCHEMA: dict[str, dict[str, str]] = {
+    "version": {"target": "str", "files": "list[str]"},
+    "forbidden": {
+        "allow_files": "list[str]",
+        "patterns": "dict[str,regex]",
+        "contains": "dict[str,list[str]]",
+    },
+    "required": {"files": "list[str]", "contains": "dict[str,list[str]]"},
+    "banned": {"paths": "list[str]"},
+    "requirements": {"file": "str", "forbidden": "list[str]"},
+    "wheel": {"build": "bool", "timeout": "int", "must_contain": "list[str]"},
+}
+
+
+def _check_type(where: str, value: object, expected: str) -> None:
+    """Validate one configuration value against the schema, or raise."""
+    if expected == "str":
+        if not isinstance(value, str):
+            raise ConfigError(f"{where} must be a string, got {type(value).__name__}")
+    elif expected == "bool":
+        if not isinstance(value, bool):
+            raise ConfigError(f"{where} must be true or false, got {value!r}")
+    elif expected == "int":
+        # bool is an int subclass, so reject it explicitly.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"{where} must be an integer, got {value!r}")
+    elif expected == "list[str]":
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ConfigError(f"{where} must be a list of strings, got {value!r}")
+    elif expected == "dict[str,list[str]]":
+        if not isinstance(value, dict):
+            raise ConfigError(f"{where} must be a table, got {type(value).__name__}")
+        for key, item in value.items():
+            _check_type(f"{where}.{key}", item, "list[str]")
+    elif expected == "dict[str,regex]":
+        if not isinstance(value, dict):
+            raise ConfigError(f"{where} must be a table, got {type(value).__name__}")
+        for key, pattern in value.items():
+            if not isinstance(pattern, str):
+                raise ConfigError(f"{where}.{key} must be a string, got {pattern!r}")
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ConfigError(f"{where}.{key} is not a valid regex: {exc}") from exc
+
+
+def validate_check_config(config: dict) -> None:
+    """Reject a structurally invalid configuration before any check runs.
+
+    P0 #2: a type error deep in a check produces either a crash or, worse, a
+    plausible-looking failure list. Validate the whole document up front so
+    the operator is told the configuration is wrong, not the project.
+    """
+    for section, value in config.items():
+        if section not in CONFIG_SCHEMA:
+            raise ConfigError(
+                f"unknown section [{section}] — expected one of: "
+                + ", ".join(sorted(CONFIG_SCHEMA))
+            )
+        if not isinstance(value, dict):
+            raise ConfigError(f"[{section}] must be a table, got {type(value).__name__}")
+
+        known = CONFIG_SCHEMA[section]
+        for key, item in value.items():
+            if key not in known:
+                raise ConfigError(
+                    f"unknown key {section}.{key} — expected one of: "
+                    + ", ".join(sorted(known))
+                )
+            _check_type(f"{section}.{key}", item, known[key])
+
+
 def load_check_config(project_dir: Path) -> dict | None:
-    """Load release_check.toml from the project root, or None."""
+    """Load release_check.toml from the project root.
+
+    Returns None only when no configuration exists. Anything present but
+    untrustworthy raises ConfigError: a broken release gate must fail closed,
+    never degrade quietly into "built-in checks only".
+    """
     config_path = project_dir / CHECK_CONFIG_NAME
-    if not config_path.is_file():
+
+    if not config_path.exists():
         return None
+    if not config_path.is_file():
+        raise ConfigError(f"{CHECK_CONFIG_NAME} exists but is not a regular file")
+
     try:
         import tomllib
-    except ImportError:
-        print(
-            f"ERROR: {CHECK_CONFIG_NAME} found but this Python has no tomllib "
-            "(needs Python 3.11+).",
-            file=sys.stderr,
-        )
-        return None
+    except ImportError as exc:  # pragma: no cover - 3.11+ is a hard requirement
+        raise ConfigError(
+            f"{CHECK_CONFIG_NAME} found but this Python has no tomllib (needs 3.11+)"
+        ) from exc
+
     try:
-        return tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        print(f"ERROR: could not parse {CHECK_CONFIG_NAME}: {exc}", file=sys.stderr)
-        return None
+        text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"could not read {CHECK_CONFIG_NAME}: {exc}") from exc
+
+    try:
+        config = tomllib.loads(text)
+    except ValueError as exc:
+        raise ConfigError(f"could not parse {CHECK_CONFIG_NAME}: {exc}") from exc
+
+    validate_check_config(config)
+    return config
 
 
 def read_project_file(project_dir: Path, rel: str) -> str:
@@ -823,7 +1280,8 @@ def run_builtin_checks(project_dir: Path, report: CheckReport) -> None:
 
     # Secret scan.
     report.section("Secret scan")
-    findings = scan_for_secrets(project_dir, files)
+    secret_scan = scan_for_secrets(project_dir, files)
+    findings = secret_scan.findings
     report.check(
         "No likely secrets in tracked text files",
         len(findings) == 0,
@@ -831,6 +1289,16 @@ def run_builtin_checks(project_dir: Path, report: CheckReport) -> None:
             f"{normalise_rel(f.rel_path)}:{f.line} [{f.label}]" for f in findings[:5]
         ),
     )
+
+    if secret_scan.unscanned:
+        report.check(
+            "All tracked text files could be scanned",
+            len(secret_scan.unscanned_text_files()) == 0,
+            "; ".join(
+                f"{normalise_rel(rel)} ({reason})"
+                for rel, reason in secret_scan.unscanned_text_files()[:5]
+            ),
+        )
 
     # Latest package inspection.
     report.section("Latest package")
@@ -1140,10 +1608,13 @@ def print_summary(
     clean: bool,
     ignore_count: int,
     findings: list[SecretFinding],
+    unscanned: list[tuple[Path, str]] | None = None,
     cleaned_dirs: int = 0,
     cleaned_files: int = 0,
     zip_uncompressed_bytes: int = 0,
     zip_sha256: str = "",
+    manifest_embedded: bool = True,
+    sidecar_written: bool = True,
 ) -> None:
     """Print a concise packaging report."""
     print()
@@ -1165,6 +1636,8 @@ def print_summary(
     if scan.force_included:
         print(f"Force-included:          {len(scan.force_included)}")
     print(f"Excluded items:          {len(scan.excluded)}")
+    if scan.skipped_symlinks:
+        print(f"Skipped symlinks:        {len(scan.skipped_symlinks)}")
     print(f"Cleanable cache dirs:    {len(scan.clean_dirs)}")
     print(f"Cleanable cache files:   {len(scan.clean_files)}")
 
@@ -1198,6 +1671,14 @@ def print_summary(
         if len(findings) > 20:
             print(f"  ... plus {len(findings) - 20} more finding(s)")
 
+    if unscanned:
+        print()
+        print(f"NOT SCANNED for secrets ({len(unscanned)}) — these ship unexamined:")
+        for rel, reason in unscanned[:20]:
+            print(f"  - {normalise_rel(rel)}  ({reason})")
+        if len(unscanned) > 20:
+            print(f"  ... plus {len(unscanned) - 20} more file(s)")
+
     if output_zip and output_zip.exists() and not dry_run:
         print()
         try:
@@ -1207,8 +1688,17 @@ def print_summary(
         print(f"Uncompressed included:   {format_bytes(zip_uncompressed_bytes)}")
         if zip_sha256:
             print(f"ZIP SHA-256:             {zip_sha256}")
-            print(f"Hash sidecar:            {output_zip.name}.sha256")
-        print(f"Manifest embedded:       {MANIFEST_ARCNAME}")
+            if sidecar_written:
+                print(f"Hash sidecar:            {output_zip.name}.sha256")
+            else:
+                print("Hash sidecar:            NOT WRITTEN — recipients have "
+                      "no trusted hash")
+        if manifest_embedded:
+            print(f"Manifest embedded:       {MANIFEST_ARCNAME}")
+        else:
+            print("Manifest embedded:       disabled (--no-manifest)")
+            print("Verification:            partial — sidecar hash only, no "
+                  "per-file manifest")
 
     if dry_run:
         print()
@@ -1266,13 +1756,26 @@ def run_all_checks(project_dir: Path) -> CheckReport:
     return report
 
 
+def report_config_error(exc: ConfigError) -> None:
+    print(
+        f"ERROR: invalid release configuration in {CHECK_CONFIG_NAME}: {exc}\n"
+        "Release gates fail closed: fix the configuration, or remove the file "
+        "to run built-in checks only.",
+        file=sys.stderr,
+    )
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     project_dir = Path(args.project).expanduser().resolve()
     if not project_dir.is_dir():
         print(f"ERROR: not a directory: {project_dir}", file=sys.stderr)
-        return 2
-    report = run_all_checks(project_dir)
-    return 1 if report.failures else 0
+        return EXIT_BAD_PROJECT
+    try:
+        report = run_all_checks(project_dir)
+    except ConfigError as exc:
+        report_config_error(exc)
+        return EXIT_BAD_CONFIG
+    return EXIT_PROBLEMS if report.failures else EXIT_OK
 
 
 # --------------------------------------------------------------------------
@@ -1308,20 +1811,24 @@ def cmd_package(args: argparse.Namespace) -> int:
     project_dir = Path(args.project).expanduser().resolve()
     if not project_dir.exists():
         print(f"ERROR: project path does not exist: {project_dir}", file=sys.stderr)
-        return 2
+        return EXIT_BAD_PROJECT
     if not project_dir.is_dir():
         print(f"ERROR: project path is not a directory: {project_dir}", file=sys.stderr)
-        return 2
+        return EXIT_BAD_PROJECT
 
     if run_checks_first:
-        report = run_all_checks(project_dir)
+        try:
+            report = run_all_checks(project_dir)
+        except ConfigError as exc:
+            report_config_error(exc)
+            return EXIT_BAD_CONFIG
         if report.failures and not args.force:
             print(
                 "ERROR: release checks failed — not packaging.\n"
                 "Fix the failures or re-run with --force.",
                 file=sys.stderr,
             )
-            return 6
+            return EXIT_CHECKS_FAILED
 
     if args.output:
         output_dir = Path(args.output).expanduser().resolve()
@@ -1330,7 +1837,16 @@ def cmd_package(args: argparse.Namespace) -> int:
 
     output_zip = output_dir / build_zip_name(project_dir, args.name)
 
-    ignore_patterns, ignore_count = load_ignore_file(project_dir)
+    try:
+        ignore_patterns, ignore_count = load_ignore_file(project_dir, strict=strict)
+    except ConfigError as exc:
+        print(
+            f"ERROR: invalid packaging configuration in {IGNORE_FILE_NAME}: {exc}\n"
+            "Strict and release packaging fail closed rather than silently "
+            "dropping every project-specific exclusion.",
+            file=sys.stderr,
+        )
+        return EXIT_BAD_CONFIG
     rules = build_rules(
         profile=args.profile,
         strict=strict,
@@ -1339,7 +1855,9 @@ def cmd_package(args: argparse.Namespace) -> int:
         include_patterns=args.include,
     )
 
-    scan = scan_project(project_dir, rules, output_dir=output_dir)
+    scan = scan_project(
+        project_dir, rules, output_dir=output_dir, output_zip=output_zip
+    )
 
     if args.list_included:
         print()
@@ -1360,13 +1878,22 @@ def cmd_package(args: argparse.Namespace) -> int:
 
         # If actual cleaning happened, rescan so deleted junk no longer appears.
         if not args.dry_run:
-            scan = scan_project(project_dir, rules, output_dir=output_dir)
+            scan = scan_project(
+                project_dir, rules, output_dir=output_dir, output_zip=output_zip
+            )
 
-    findings: list[SecretFinding] = []
+    secret_scan = SecretScanResult()
     if scan_secrets:
-        findings = scan_for_secrets(project_dir, scan.included_files)
+        secret_scan = scan_for_secrets(project_dir, scan.included_files)
+    findings = secret_scan.findings
 
-    if findings and fail_on_secrets and not args.force:
+    # Release mode claims to refuse shipping secrets. It cannot honour that
+    # claim for files it never read, so an unscanned text file blocks too.
+    blocking_unscanned = (
+        secret_scan.unscanned_text_files() if fail_on_secrets and scan_secrets else []
+    )
+
+    if (findings or blocking_unscanned) and fail_on_secrets and not args.force:
         print_summary(
             project_dir=project_dir,
             output_zip=output_zip,
@@ -1377,22 +1904,39 @@ def cmd_package(args: argparse.Namespace) -> int:
             clean=clean,
             ignore_count=ignore_count,
             findings=findings,
+            unscanned=secret_scan.unscanned,
             cleaned_dirs=cleaned_dirs,
             cleaned_files=cleaned_files,
+            manifest_embedded=not args.no_manifest,
         )
-        print(
-            "ERROR: possible secrets found and strict/release mode is active.\n"
-            "Fix the findings, exclude the files, or re-run with --force.",
-            file=sys.stderr,
-        )
-        return 5
+        if findings:
+            print(
+                "ERROR: possible secrets found and strict/release mode is active.\n"
+                "Fix the findings, exclude the files, or re-run with --force.",
+                file=sys.stderr,
+            )
+        if blocking_unscanned:
+            print(
+                "ERROR: text files could not be secret-scanned and strict/release "
+                "mode is active:",
+                file=sys.stderr,
+            )
+            for rel, reason in blocking_unscanned[:10]:
+                print(f"  - {normalise_rel(rel)} ({reason})", file=sys.stderr)
+            print(
+                "These files ship unexamined. Exclude them, reduce their size, "
+                "or re-run with --force.",
+                file=sys.stderr,
+            )
+        return EXIT_SECRETS
 
     zip_uncompressed_bytes = 0
     zip_sha256 = ""
+    sidecar_written = True
     if not args.dry_run:
         manifest = None if args.no_manifest else build_manifest(project_dir, scan.included_files)
         try:
-            zip_uncompressed_bytes, zip_sha256 = create_zip(
+            zip_uncompressed_bytes, zip_sha256, sidecar_written = create_zip(
                 project_dir,
                 scan.included_files,
                 output_zip,
@@ -1401,10 +1945,16 @@ def cmd_package(args: argparse.Namespace) -> int:
             )
         except FileExistsError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
-            return 3
+            return EXIT_OUTPUT_EXISTS
+        except ReservedNameError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_RESERVED_NAME
+        except ContainmentError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_CONTAINMENT
         except OSError as exc:
             print(f"ERROR: could not create ZIP: {exc}", file=sys.stderr)
-            return 4
+            return EXIT_OS_ERROR
 
     print_summary(
         project_dir=project_dir,
@@ -1416,11 +1966,25 @@ def cmd_package(args: argparse.Namespace) -> int:
         clean=clean,
         ignore_count=ignore_count,
         findings=findings,
+        unscanned=secret_scan.unscanned,
         cleaned_dirs=cleaned_dirs,
         cleaned_files=cleaned_files,
         zip_uncompressed_bytes=zip_uncompressed_bytes,
         zip_sha256=zip_sha256,
+        manifest_embedded=not args.no_manifest,
+        sidecar_written=sidecar_written,
     )
+
+    # A release with no sidecar has no trusted hash for its recipient to check
+    # against, which removes the point of shipping it as a verified artifact.
+    if not sidecar_written and fail_on_secrets and not args.force:
+        print(
+            "ERROR: the hash sidecar could not be written, so this release has "
+            "no trusted\nhash to verify against. Fix the output location, or "
+            "re-run with --force.",
+            file=sys.stderr,
+        )
+        return EXIT_OS_ERROR
 
     if args.open and not args.dry_run:
         open_folder(output_dir)

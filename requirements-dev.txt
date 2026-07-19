@@ -1,0 +1,2 @@
+# Development dependencies. The tool itself is stdlib-only.
+pytest>=8.0
