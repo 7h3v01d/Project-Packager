@@ -9,8 +9,8 @@ Outstanding work is marked both `defect` (for filtering) and
 `xfail(strict=True)` (for clean pytest semantics), so a normal run is green:
 
 ```bash
-pytest                    # 168 passed, 27 xfailed — the expected release state
-pytest -m "not defect"    # 168 passed — baseline only
+pytest                    # 191 passed, 27 xfailed — the expected release state
+pytest -m "not defect"    # 191 passed — baseline only
 pytest -m defect          # the v3.1.0 work list, as XFAIL
 pytest -rx                # list the outstanding items with their reasons
 ```
@@ -28,7 +28,7 @@ Current state:
 
 | Selection | v3.0.0 | v3.0.1 |
 |-----------|--------|--------|
-| baseline | 85 passed | **168 passed** |
+| baseline | 85 passed | **191 passed** |
 | outstanding | 55 | 27 |
 
 As each defect is fixed, delete both its `@pytest.mark.defect` and
@@ -45,8 +45,8 @@ and manifest-disabled reporting.
 ### What remains for v3.1.0
 
 Atomic archive creation, snapshot-consistent manifests, hardened and streaming
-verification, cleaning revalidation, the ordered rule engine (later-rule
-precedence and root-anchored patterns), and secret-scanner improvements.
+verification, cleaning revalidation, later-rule
+precedence in the ordered rule engine, and secret-scanner improvements.
 
 ## Layout
 
@@ -117,13 +117,24 @@ one implementation gets enforced.
 
 ## Findings beyond the report
 
-`test_path_patterns_are_root_anchored` records a defect found while building the
-suite. `build_rules` files a trailing-slash pattern such as `docs/` into
-`rules.dir_patterns`, which `should_exclude_dir` matches against the bare
-directory *name*. An exclusion aimed at the project root therefore prunes every
-same-named directory at any depth: `--exclude "docs/"` silently drops
-`src/docs/` as well. This belongs with the ordered rule engine's root-anchoring
-requirement.
+**Pattern anchoring.** Building the suite surfaced that `--exclude "docs/"` was
+matched against the bare directory name at any depth, and an early version of
+this suite asserted that a trailing slash alone should make a pattern
+root-only. External review rejected that as a surprising contract: under
+gitignore conventions `docs/` legitimately means a directory named `docs`
+anywhere. Redesigning the test around three explicit cases then exposed a worse
+problem — `/docs/` was being *silently discarded*, so a user who wrote it got no
+exclusion and no warning. All three cases are now implemented and covered by
+baseline tests:
+
+| Pattern | Meaning |
+|---------|---------|
+| `docs/` | a directory named `docs` at any depth |
+| `/docs/` | the project-root `docs` directory only |
+| `src/docs/` | that specific relative subtree |
+
+Worth recording because the sequence is instructive: a test can be red for the
+wrong reason, and a wrong specification is more dangerous than a missing one.
 
 `test_mistyped_subcommand_falls_through_to_package` records a consequence of the
 backward-compatibility shim rather than a defect: `main()` prepends `package` to

@@ -87,9 +87,13 @@ classified by content, not size:
 
 - **Binary assets** — images, PDFs, wheels, media — are recorded as
   intentionally unscanned and do not block a release.
-- **Text files it could not read** — over the 1 MiB limit, not valid UTF-8, or
-  unreadable — block strict and release packaging unless you add `--force`,
-  because they ship unexamined.
+- **Text files it could not read** — over the 1 MiB limit, not decodable as
+  supported Unicode text, or unreadable — block strict and release packaging
+  unless you add `--force`, because they ship unexamined.
+
+Supported text encodings are UTF-8, UTF-8 with BOM, UTF-16LE/BE (with or
+without a BOM), and UTF-32. Classification follows content, never the filename:
+a printable file named `report.pdf` is scanned, and a real PNG is not.
 
 Likewise, the secret scanner is heuristic. It detects known token shapes in
 files it can read, reports files it could not scan, and blocks release mode on

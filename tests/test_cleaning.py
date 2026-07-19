@@ -250,3 +250,20 @@ def test_existing_output_without_overwrite_does_not_clean(
     assert code == 3
     assert cache.is_dir(), "a refused command must leave the project untouched"
     assert existing.read_bytes() == b"previous archive"
+
+
+def test_reserved_name_refusal_does_not_clean(clean_project: Path, out_dir: Path) -> None:
+    """The collision is known immediately after scanning, so nothing should
+    have been deleted by the time the run is refused."""
+    cache = clean_project / "__pycache__"
+    cache.mkdir()
+    (cache / "a.pyc").write_text("cache\n", encoding="utf-8")
+    write(clean_project / pkg.MANIFEST_ARCNAME, '{"mine": true}\n')
+
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 8
+    assert cache.is_dir(), "a refused command must leave the project untouched"
+    assert list(out_dir.glob("*.zip")) == []

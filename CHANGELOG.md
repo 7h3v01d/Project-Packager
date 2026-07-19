@@ -4,6 +4,19 @@ All notable changes to Project Packager are recorded here.
 
 ## 3.0.1 — Safety hotfix
 
+### Corrections following external review of 3.0.1-rc5
+
+- **Binary detection uses control-byte density, not NUL presence.** A single
+  NUL in an otherwise printable file was enough to label it "binary content —
+  not scanned by design", so a key beside it shipped with exit 0. One NUL is
+  damage or noise — from generated config, a truncated write, or deliberate
+  disguise — not proof of binary content. Files are now judged on the
+  proportion of unexpected control bytes, with recognised magic bytes remaining
+  the strongest signal.
+- **Reserved-name collisions are refused before cleaning.** The collision is
+  known immediately after scanning, but was raised inside `create_zip()`, so a
+  run that correctly exited 8 had already deleted cache directories.
+
 ### Corrections following external review of 3.0.1-rc4
 
 - **Unicode text is decoded before binary classification.** `looks_binary` was

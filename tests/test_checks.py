@@ -725,3 +725,80 @@ def test_plain_utf8_is_unaffected(clean_project: Path) -> None:
     target.write_text(f'KEY = "{FAKE_AWS_KEY}"  # café ☕\n', encoding="utf-8")
     result = pkg.scan_for_secrets(clean_project, [target])
     assert len(result.findings) == 1
+
+
+# --------------------------------------------------------------------------
+# NUL density, not NUL presence (external review, rc5)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("filename", ["config.txt", ".env", "notes.unknownext", "app.py"])
+def test_isolated_nul_does_not_disqualify_a_text_file(
+    clean_project: Path, filename: str
+) -> None:
+    """One NUL is damage or noise, not proof of binary content.
+
+    Treating a single NUL as definitive let an otherwise printable file be
+    labelled "binary content — not scanned by design", so the key inside it
+    shipped. Damaged text, generated config, and deliberately disguised text
+    all land here.
+    """
+    target = clean_project / filename
+    target.write_bytes(
+        b"setting = normal printable text\n\x00\n"
+        + f'KEY = "{FAKE_AWS_KEY}"\n'.encode()
+        + b"trailing printable text\n"
+    )
+
+    result = pkg.scan_for_secrets(clean_project, [target])
+    assert [f.label for f in result.findings] == ["AWS access key"]
+    assert result.unscanned == []
+
+
+def test_isolated_nul_secret_blocks_release(clean_project: Path, out_dir: Path) -> None:
+    (clean_project / "config.txt").write_bytes(
+        b"setting = value\n\x00\n" + f'KEY = "{FAKE_AWS_KEY}"\n'.encode()
+    )
+    code = pkg.main(
+        ["package", str(clean_project), "--profile", "release",
+         "--output", str(out_dir), "--name", "rel"]
+    )
+    assert code == 5
+    assert list(out_dir.glob("*.zip")) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload"),
+    [
+        ("blob.dat", b"\x00\x01\x02" * 400),
+        ("dump.bin", bytes(range(256)) * 40),
+        ("mystery.unknownext", b"\x01\x02\x03\x04\x05\x06\x07\x0e\x0f" * 200),
+    ],
+)
+def test_dense_control_bytes_are_still_binary(
+    clean_project: Path, filename: str, payload: bytes
+) -> None:
+    """The heuristic still works where it should: density, not presence."""
+    target = clean_project / filename
+    target.write_bytes(payload)
+
+    result = pkg.scan_for_secrets(clean_project, [target])
+    assert result.unscanned[0].kind is pkg.UnscannedKind.BINARY
+
+
+def test_binary_control_ratio_is_proportional() -> None:
+    """The threshold is a ratio, so file size does not change the verdict."""
+    mostly_text = b"a" * 5000 + b"\x00" + b"b" * 5000
+    dense = b"\x00\x01\x02" * 100
+
+    assert pkg.binary_control_ratio(mostly_text) < 0.01
+    assert pkg.binary_control_ratio(dense) > 0.9
+    assert not pkg.looks_binary(mostly_text)
+    assert pkg.looks_binary(dense)
+
+
+def test_tabs_and_newlines_are_not_binary_signals(clean_project: Path) -> None:
+    target = clean_project / "table.tsv"
+    target.write_bytes(b"col\tcol\r\n" * 500 + f'KEY = "{FAKE_AWS_KEY}"\n'.encode())
+    result = pkg.scan_for_secrets(clean_project, [target])
+    assert len(result.findings) == 1

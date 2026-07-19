@@ -690,15 +690,38 @@ def walk_check_tree(project_dir: Path) -> list[Path]:
 # --------------------------------------------------------------------------
 
 
+# Control bytes that appear legitimately in text: tab, LF, VT, FF, CR, ESC.
+TEXT_CONTROL_BYTES = frozenset({0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x1B})
+
+# Above this proportion of unexpected control bytes, treat data as binary.
+# Real text sits near zero; a stray NUL in a config file is well under it.
+BINARY_CONTROL_RATIO = 0.05
+
+
+def binary_control_ratio(sample: bytes) -> float:
+    """Proportion of bytes that would be surprising in text."""
+    if not sample:
+        return 0.0
+    odd = sum(
+        1
+        for byte in sample
+        if (byte < 0x20 and byte not in TEXT_CONTROL_BYTES) or byte == 0x7F
+    )
+    return odd / len(sample)
+
+
 def looks_binary(sample: bytes) -> bool:
     """Last-resort heuristic, consulted only after Unicode decoding has failed.
 
-    A NUL byte is a reasonable binary signal for byte-oriented text, but UTF-16
-    encodes ASCII as alternating NULs, so this must never be the *first*
-    question asked. Treating it as such classified UTF-16 PowerShell scripts as
-    binary and shipped the secrets inside them unexamined.
+    Density, not presence. A single NUL does not prove a file is binary — it
+    may be damaged text, generated configuration, or text disguised on purpose
+    — and treating one as definitive meant an otherwise printable file was
+    labelled "not scanned by design" while a key inside it shipped.
+
+    Presence was also the wrong question for another reason: UTF-16 encodes
+    ASCII as alternating NULs, so this is never the first test applied.
     """
-    return b"\x00" in sample
+    return binary_control_ratio(sample) > BINARY_CONTROL_RATIO
 
 
 # Ordered longest-first: the UTF-32LE BOM begins with the UTF-16LE BOM, so
@@ -2243,6 +2266,16 @@ def cmd_package(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return EXIT_SECRETS
+
+    # Preflight the reserved-name collision here, where it is already known
+    # from the scan, rather than discovering it inside create_zip() after
+    # cleaning has already deleted things. create_zip() checks again as
+    # defence in depth.
+    try:
+        assert_no_reserved_collision(project_dir, scan.included_files)
+    except ReservedNameError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return EXIT_RESERVED_NAME
 
     # The most common refusal of all: the output already exists. Checked here,
     # before anything mutates the project. create_zip() checks again as defence
