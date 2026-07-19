@@ -28,12 +28,26 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      # Windows runners permit symlink creation, so the symlink containment
-      # tests execute rather than skipping. Those cover the P0 privacy defect,
-      # so a run where they silently skip is materially weaker.
-      - name: Enable symlink support (Windows)
-        if: runner.os == 'Windows'
-        run: git config --global core.symlinks true
+      # The symlink containment tests cover the highest-priority defect from
+      # the original report, so a run where they silently skip is materially
+      # weaker than it looks. PP_REQUIRE_SYMLINKS turns that skip into a
+      # failure, so CI reports whether the privilege actually exists rather
+      # than us assuming it does. (git config core.symlinks was previously
+      # used here; it affects git checkout, not os.symlink, so it did nothing.)
+      - name: Verify symlink creation is available
+        shell: python
+        run: |
+          import os, pathlib, sys, tempfile
+          d = pathlib.Path(tempfile.mkdtemp())
+          target, link = d / "t", d / "l"
+          target.write_text("probe")
+          try:
+              os.symlink(target, link)
+          except (OSError, NotImplementedError):
+              print("::warning::symlink creation unavailable; containment "
+                    "tests would skip on this runner")
+              sys.exit(0)
+          print("symlink creation available")
 
       # The whole suite, exactly as documented. Outstanding v3.1.0 work is
       # marked xfail(strict=True), so this passes with XFAILs — and a
@@ -42,6 +56,11 @@ jobs:
       # continue-on-error: that arrangement let CI stay green while the
       # documented `pytest` command failed and while markers went stale.
       - name: Full suite
+        env:
+          # Both hosted runners are expected to permit symlinks. If that ever
+          # stops being true, this fails loudly instead of quietly dropping
+          # the privacy tests from the run.
+          PP_REQUIRE_SYMLINKS: "1"
         run: python -m pytest -rxX
 
   self_package:
