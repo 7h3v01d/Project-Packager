@@ -2,9 +2,107 @@
 
 All notable changes to Project Packager are recorded here.
 
-## Unreleased — GUI
+## 3.1.0 — Consolidation
 
-### Added
+Every outstanding `defect` test is fixed and its markers removed: the full
+suite is green with no xfails, which is the acceptance gate in
+`tests/README.md`. Each fix was confirmed to fail against the previous build.
+
+### Signing, installation, and polish
+
+- **Optional minisign signatures.** `package --sign [--sign-key FILE]` writes
+  `<zip>.minisig` with a signed comment recording tool version, file name and
+  SHA-256. Preflighted before anything is written or cleaned. `verify --pubkey
+  FILE` / `--pubkey-string KEY` checks it; an unchecked signature is warned
+  about, never silently trusted. Overwriting removes a stale signature. This
+  closes the "who made it" gap the README previously listed as out of scope.
+  `tests/test_signing.py` (11 tests); `PP_REQUIRE_MINISIGN=1` turns skips into
+  failures, and CI sets it on Linux.
+- **pip-installable**: `pyproject.toml` installs the single file as a module
+  with a `project-packager` command. Version comes from `TOOL_VERSION`.
+- **The project gates its own releases**: `release_check.toml` checks version
+  alignment, forbids the retired brand and personal LAN IPs, requires the
+  licence header, bans a `src/` tree, sets size limits, and builds the wheel.
+  CI installs with pip, runs `check`, then packages itself in release mode,
+  signed, and verifies the signature.
+- **`check` no longer writes into the project when building a wheel.**
+  setuptools builds in place, so `[wheel] build = true` left `build/` and
+  `*.egg-info/` in the source tree, breaking the documented promise that
+  `check` never modifies anything. The wheel is now built from a temporary
+  copy (VCS, venvs, caches and build output skipped; links copied as links).
+  Found when this project's own `release_check.toml` turned the gate on.
+- **Typo hint**: `chekc` now says *Did you mean 'check'?* (still exit 2). A
+  real folder with that name is still packaged.
+- **`package.bat` found Python incorrectly** when the `py` launcher was
+  present: `PYTHON` became `py -3`, and every `"%PYTHON%"` call then looked
+  for a program literally named `py -3`. It now resolves the interpreter's full
+  path (preferring `python`), and refuses anything older than 3.11.
+- The expected zipfile "Duplicate name" warning in
+  `test_duplicate_member_fails` is filtered on that test only: the suite runs
+  with no warnings.
+
+### Atomic, snapshot-consistent archives
+
+- **Archives are written atomically.** Everything goes to `<zip>.part` and is
+  swapped in with `os.replace` only when complete. A failed run leaves no
+  partial archive and no temporary files, and a failed `--overwrite` leaves the
+  previous archive byte-for-byte intact. The sidecar is written to a temporary
+  name first and swapped in straight after the archive; if it can't be, any
+  stale sidecar from an overwritten archive is removed rather than left to
+  describe the wrong file.
+- **`--overwrite` is no longer refused in strict/release mode.** The refusal
+  was explicitly a stopgap until replacement was atomic. Two baseline tests
+  encoded the stopgap itself and were rewritten to test the guarantee it stood
+  in for: `test_overwrite_in_release_replaces_atomically` and
+  `test_refused_overwrite_does_not_clean_the_project` (now: a release refused
+  for a secret, with `--overwrite`, cleans nothing and keeps the old archive).
+- **Manifests are snapshot-consistent.** Before the manifest is embedded,
+  every member is streamed back out of the temporary archive and checked
+  against it. A file that changes, appears or disappears mid-package fails the
+  run with exit 4 and a clear message, instead of shipping an archive that
+  fails its own verification.
+- **`build_manifest` no longer silently drops a file it cannot read.**
+
+### Hardened verification
+
+- One streaming core, `inspect_archive()`, used by `verify`, by `check`'s
+  latest-package inspection, and (manifest validation) by `diff`.
+- Refused before decompression: more than 200,000 members; members or a
+  manifest declaring expansion beyond 1000× the archive size (above 256 MB);
+  a manifest over 64 MB.
+- Duplicate member names are named as duplicates, not detected by accident
+  via a hash mismatch.
+- Unsafe member names — absolute, drive-qualified, UNC, backslashed, NUL,
+  `..` traversal — fail by name, whether or not the manifest lists them.
+- Manifest structure is validated first (types, required fields, digest
+  format, duplicate paths, `file_count`, `total_bytes`). A malformed manifest is
+  one clear failure, not every member reported "not in manifest".
+- Per-file declared size must match both the central directory and the bytes
+  actually streamed.
+- Members are hashed as streams; no member is ever read whole.
+
+### Cleaning and scanning
+
+- **Cleaning revalidates every target immediately before deleting it**:
+  inside the project root recorded at scan time, an approved cache name, the
+  expected type, and not a symlink. Paths collected at scan time are no longer
+  trusted at deletion time.
+- **Secret previews are strongly redacted**: at most the four-character type
+  prefix plus the token length (`AKIA…[20 chars redacted]`). v3.0.0 showed ten
+  characters — six of them real secret material.
+
+### Ordered rule precedence
+
+- **The last matching rule wins**, as in gitignore: built-in rules, then
+  `.packagerignore` top to bottom, then `--exclude`, then `--include`. So
+  `*.log` then `!run.log` ships `run.log`, and `!run.log` then `*.log` does not.
+  An earlier draft of the `!` feature below made `!` always win, which let
+  `test_later_rules_override_earlier_rules` pass for the wrong reason; the
+  test now asserts both orders. The GUI's "add rule" moves an existing rule to
+  the end so it becomes the winning line.
+
+
+### Added — GUI and tooling
 
 - **`--gui` / `gui` subcommand: a visual include/exclude editor.** Tree preview
   of the whole project with per-file status and reason, toggle in/out by

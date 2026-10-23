@@ -184,6 +184,12 @@ never modifies your project — no cleaning, no partial archives, nothing.
 outside the project is skipped and counted in the summary. This is the main
 thing standing between you and accidentally packaging your home directory.
 
+**Writing is atomic.** The archive is built under a temporary name and only
+swapped in when it's complete and verified against its own manifest. A failed
+run leaves nothing behind, and `--overwrite` can never destroy a good archive.
+If a file changes while it's being packaged, the run fails (exit 4) instead of
+shipping a manifest that doesn't match.
+
 **`--force` is for judgement calls, not broken config.** It overrides secret
 findings and failed checks. It will not override an unusable `.packagerignore`,
 because that isn't a judgement call.
@@ -202,12 +208,8 @@ being shipped.
 
 Read these before relying on it for anything important.
 
-- **Replacement is not atomic.** A failed write can leave a partial file, and
-  `--overwrite` can destroy a good archive. That's why `--overwrite` is refused
-  in release mode unless you add `--force`. Fixed in v3.1.0.
-- **`verify` is a corruption detector, not a hostile-archive verifier.** It
-  doesn't yet reject duplicate members, unsafe member paths, or malformed
-  manifest structure.
+- **Packaging reads each file twice** — once for the manifest, once back from
+  the archive to prove they match. Safe, but slower on very large projects.
 - **The secret scanner is heuristic.** It finds known token shapes in files it
   can read, and reports the files it couldn't. It cannot prove your project is
   secret-free — it supplements provider-side revocation and human review rather
@@ -248,6 +250,10 @@ python project_packager.py why path/to/file
 
 # What changed since the last release?
 python project_packager.py diff ..\packaged\myproj_2026-09-01_1200.zip .
+
+# Signed release, and checking one
+python project_packager.py package . --profile release --sign
+python project_packager.py verify app_2026-10-24_0900.zip --pubkey minisign.pub
 
 # Rescue something the defaults dropped
 python project_packager.py package . --include "docs/diagrams/*.png"

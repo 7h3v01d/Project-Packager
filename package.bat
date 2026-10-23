@@ -284,7 +284,7 @@ echo      0   Success
 echo      1   Checks failed, or verification found a problem
 echo      2   Project path missing or not a directory
 echo      3   Output ZIP already exists - use overwrite
-echo      4   Write error, or archive has no verification evidence
+echo      4   Write error, a file changed mid-package, or no evidence
 echo      5   Secrets, or unscannable text, in strict/release mode
 echo      6   Non-secret release checks failed
 echo      7   Partial verification - hash matched, no manifest to check
@@ -302,8 +302,8 @@ echo.
 echo     Cleaning only ever removes cache junk. It will not touch .venv,
 echo     build/, dist/, logs or databases.
 echo.
-echo     Replacement is not atomic yet. A failed write can destroy an existing
-echo     archive, which is why release mode refuses overwrite without force.
+echo     Writing is atomic. A failed run leaves no partial archive, and
+echo     overwrite can never destroy the previous one.
 echo.
 pause
 goto :menu
@@ -394,14 +394,26 @@ pause
 exit /b 0
 
 :find_python
+REM Resolve the interpreter's full path. Setting PYTHON to "py -3" broke every
+REM "%PYTHON%" call: quoted, Windows looks for a program literally named
+REM "py -3". A full path quotes safely, spaces and all. No %PYTHON% inside
+REM ( ) blocks: a path like "Program Files (x86)" would end the block early.
 set "PYTHON="
-py -3 --version >nul 2>&1 && set "PYTHON=py -3"
-if defined PYTHON exit /b 0
-python --version >nul 2>&1 && set "PYTHON=python"
-if defined PYTHON exit /b 0
+for /f "delims=" %%P in ('python -c "import sys; print(sys.executable)" 2^>nul') do set "PYTHON=%%P"
+if defined PYTHON goto :check_python_version
+for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "PYTHON=%%P"
+if defined PYTHON goto :check_python_version
 echo.
 echo   ERROR: Python was not found.
 echo   Install Python 3.11 or newer and make sure it is on PATH.
+exit /b 1
+
+:check_python_version
+"%PYTHON%" -c "import sys; sys.exit(sys.version_info < (3, 11))" >nul 2>&1
+if not errorlevel 1 exit /b 0
+echo.
+echo   ERROR: Project Packager needs Python 3.11 or newer. Found:
+echo   "%PYTHON%"
 exit /b 1
 
 :find_packager

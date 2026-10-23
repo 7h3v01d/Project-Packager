@@ -1,15 +1,16 @@
 # Project Packager regression suite
 
 Written against the **target behaviour** described in the remediation report
-rather than against whatever the tool currently does. The v3.0.1 hardening pass
-is complete; tests carrying the `defect` marker encode work still outstanding
-for the **v3.1.0 consolidation release**.
+rather than against whatever the tool currently does. As of **v3.1.0 every
+`defect` test is fixed** and its markers removed: the whole suite is green with
+no xfails, which is the hardened-release acceptance gate described below. The
+`defect` marker stays registered for future outstanding work.
 
 Outstanding work is marked both `defect` (for filtering) and
 `xfail(strict=True)` (for clean pytest semantics), so a normal run is green:
 
 ```bash
-pytest                    # 191 passed, 27 xfailed — the expected release state
+pytest                    # 281 passed — the expected v3.1.0 state (11 need minisign)
 pytest -m "not defect"    # 191 passed — baseline only
 pytest -m defect          # the v3.1.0 work list, as XFAIL
 pytest -rx                # list the outstanding items with their reasons
@@ -26,10 +27,16 @@ regression.
 
 Current state:
 
-| Selection | v3.0.0 | v3.0.1 |
-|-----------|--------|--------|
-| baseline | 85 passed | **191 passed** |
-| outstanding | 55 | 27 |
+| Selection | v3.0.0 | v3.0.1 | v3.1.0 |
+|-----------|--------|--------|--------|
+| baseline | 85 passed | 191 passed | **281 passed** |
+| outstanding | 55 | 27 | **0** |
+
+v3.1.0's 281 includes 62 tests for features added in that release
+(`test_gui_rules.py`, `test_why_diff_limits.py`, `test_signing.py`) and two
+rewritten stopgap tests — see CHANGELOG. Three GUI tests skip where tkinter or a
+display is unavailable; ten signing tests skip without minisign on PATH
+(`PP_REQUIRE_MINISIGN=1` makes that a failure, as CI does on Linux).
 
 As each defect is fixed, delete both its `@pytest.mark.defect` and
 `@pytest.mark.xfail` decorators. When the
@@ -42,11 +49,17 @@ All six P0 items: symlink escape, fail-closed configuration, output-to-project-r
 include reopening (plus Windows separator normalisation), reserved manifest name,
 and manifest-disabled reporting.
 
-### What remains for v3.1.0
+### What v3.1.0 closed
 
 Atomic archive creation, snapshot-consistent manifests, hardened and streaming
-verification, cleaning revalidation, later-rule
-precedence in the ordered rule engine, and secret-scanner improvements.
+verification, cleaning revalidation, later-rule precedence in the ordered rule
+engine, and redacted secret previews. Every promoted test was confirmed to fail
+against the v3.0.1 build first.
+
+Two v3.0.1 baseline tests encoded the "`--overwrite` refused in release mode
+until atomic" stopgap. With atomic replacement in place they were rewritten to
+test the guarantee directly (`test_overwrite_in_release_replaces_atomically`,
+`test_refused_overwrite_does_not_clean_the_project`).
 
 ## Layout
 
@@ -59,6 +72,9 @@ precedence in the ordered rule engine, and secret-scanner improvements.
 | `test_checks.py` | Release config loading, gates, secret scanner |
 | `test_cleaning.py` | `--clean` blast radius and containment |
 | `test_exit_codes.py` | Every code in the README table, plus CLI surface |
+| `test_gui_rules.py` | `!` lines, ordered precedence, `IgnoreFile`, rule attribution, Tk smoke tests |
+| `test_why_diff_limits.py` | `why`, `diff`, `[limits]`, allow-secret marker, GUI settings |
+| `test_signing.py` | minisign signing and signature verification |
 
 ## Ported pysharepack tests
 

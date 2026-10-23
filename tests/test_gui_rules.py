@@ -84,6 +84,39 @@ def test_bang_line_overrides_user_exclusion_in_subtree(tmp_path):
     assert included(proj, ignore_lines=lines) == {"data/raw/sample.csv"}
 
 
+def test_later_exclude_beats_earlier_bang_line(tmp_path):
+    """REVERT-PROVEN: "!" lines used to win regardless of position. Ordered
+    precedence (gitignore semantics) means the last matching line wins."""
+    proj = make(tmp_path, {"run.log": "", "other.log": "", "a.py": ""})
+    rules = pp.build_rules(profile="share", strict=False,
+                           ignore_patterns=["!run.log", "*.log"],
+                           extra_excludes=[], include_patterns=[])
+    scan = pp.scan_project(proj, rules)
+    got = {pp.normalise_rel(p.relative_to(proj)) for p in scan.included_files}
+    assert got == {"a.py"}
+
+
+def test_later_folder_exclude_beats_earlier_bang_inside_it(tmp_path):
+    proj = make(tmp_path, {"data/keep.csv": "", "data/drop.csv": "", "a.py": ""})
+    assert included(proj, ignore_lines=["!data/keep.csv", "data/"]) == {"a.py"}
+    assert included(proj, ignore_lines=["data/", "!data/keep.csv"]) == {"a.py", "data/keep.csv"}
+
+
+def test_bang_still_beats_builtins_wherever_it_sits(tmp_path):
+    proj = make(tmp_path, {"old.zip": "", "a.py": ""})
+    assert "old.zip" in included(proj, ignore_lines=["!old.zip", "docs/"])
+
+
+def test_cli_exclude_beats_file_bang_and_cli_include_beats_everything(tmp_path):
+    proj = make(tmp_path, {"run.log": "", "a.py": ""})
+    def run(excl, incl):
+        rules = pp.build_rules(profile="share", strict=False, ignore_patterns=["!run.log"],
+                               extra_excludes=excl, include_patterns=incl)
+        return {pp.normalise_rel(p.relative_to(proj)) for p in pp.scan_project(proj, rules).included_files}
+    assert run(["*.log"], []) == {"a.py"}
+    assert run(["*.log"], ["run.log"]) == {"a.py", "run.log"}
+
+
 def test_escaped_bang_is_a_literal_exclusion(tmp_path):
     proj = make(tmp_path, {"!odd.txt": "", "b.txt": ""})
     assert included(proj, ignore_lines=["\\!odd.txt"]) == {"b.txt"}
@@ -97,14 +130,11 @@ def test_cli_exclude_bang_stays_literal(tmp_path):
     assert rules.include_patterns == set()
 
 
-def test_bang_cannot_reach_a_symlink(tmp_path):
+def test_bang_cannot_reach_a_symlink(tmp_path, needs_symlinks):
     proj = make(tmp_path, {"real.txt": "x"})
     outside = tmp_path / "secret.txt"
     outside.write_text("k", encoding="utf-8")
-    try:
-        os.symlink(outside, proj / "link.txt")
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
+    os.symlink(outside, proj / "link.txt")
     assert "link.txt" not in included(proj, ignore_lines=["!/link.txt", "!*"])
 
 
@@ -126,12 +156,22 @@ def test_ignorefile_preserves_comments_and_order(tmp_path):
         "# keep me\n*.log\n\n# section\ndocs/\n", encoding="utf-8")
     ig = pp.IgnoreFile.load(proj)
     assert ig.add("!/docs/readme.md")
-    assert not ig.add("*.log")            # duplicate
+    assert not ig.add("!/docs/readme.md")  # already the last rule: no change
     assert ig.remove("docs/")
     ig.save()
     text = (proj / ".packagerignore").read_text(encoding="utf-8")
     assert text == "# keep me\n*.log\n\n# section\n!/docs/readme.md\n"
     assert pp.load_ignore_file(proj)[0] == ["*.log", "!/docs/readme.md"]
+
+
+def test_ignorefile_readding_moves_rule_to_the_end(tmp_path):
+    """Order decides precedence, so re-adding must make the rule win."""
+    proj = make(tmp_path, {})
+    ig = pp.IgnoreFile.load(proj)
+    ig.add("/a.py")
+    ig.add("!/a.py")
+    assert ig.add("/a.py")
+    assert ig.patterns() == ["!/a.py", "/a.py"]
 
 
 def test_ignorefile_new_file_gets_template_header(tmp_path):

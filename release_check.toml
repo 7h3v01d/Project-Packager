@@ -1,0 +1,36 @@
+# Release gates for Project Packager itself — `python project_packager.py check .`
+schema_version = 1
+
+[version]
+# TOOL_VERSION is the single source of truth (pyproject.toml reads it).
+target = "3.1.0"
+files = ["project_packager.py", "CHANGELOG.md"]
+
+[forbidden]
+# The test suite plants a LAN IP on purpose to test this very gate.
+allow_files = ["test_checks.py"]
+
+[forbidden.patterns]
+"personal LAN IP" = "192\\.168\\.\\d{1,3}\\.\\d{1,3}"
+"retired brand"   = "(?i)keystone"
+
+[required]
+files = ["LICENSE", "README.md", "CHANGELOG.md", "QUICKSTART.md", "pyproject.toml",
+         "tests/conftest.py", ".github/workflows/tests.yml"]
+
+[required.contains]
+"project_packager.py" = ["Licensed under the Apache License, Version 2.0", "Leon Priest"]
+
+[banned]
+paths = ["src/"]   # single-file by design; conftest would silently switch to src/
+
+[limits]
+max_file_mb = 1
+max_total_mb = 5
+
+[wheel]
+# Proves `pip install .` produces a working module. Needs pip to fetch
+# setuptools, so release packaging needs network access.
+build = true
+timeout = 300
+must_contain = ["project_packager.py"]

@@ -1,0 +1,33 @@
+# Installs the single-file tool as a module plus a `project-packager` command.
+# The file itself stays the whole program: copying project_packager.py
+# anywhere still works exactly as before.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-packager"
+dynamic = ["version"]
+description = "Safe, audit-friendly project packaging, release checks, and archive verification."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Leon Priest" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Environment :: Console",
+]
+
+[project.urls]
+Homepage = "https://github.com/7h3v01d"
+
+[project.scripts]
+project-packager = "project_packager:main"
+
+[tool.setuptools]
+py-modules = ["project_packager"]
+
+[tool.setuptools.dynamic]
+# Single source of truth: the constant in the script.
+version = { attr = "project_packager.TOOL_VERSION" }

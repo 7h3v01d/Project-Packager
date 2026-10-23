@@ -233,8 +233,6 @@ def test_complete_secrets_are_never_printed(clean_project: Path, out_dir: Path, 
     assert FAKE_GITHUB_TOKEN not in combined
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_previews_are_strongly_redacted(clean_project: Path) -> None:
     """Report: 'More strongly redacted previews'.
 

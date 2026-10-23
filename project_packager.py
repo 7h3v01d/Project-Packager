@@ -67,7 +67,7 @@ from pathlib import Path
 from typing import Iterable
 
 TOOL_NAME = "project_packager"
-TOOL_VERSION = "3.0.1"
+TOOL_VERSION = "3.1.0"
 
 MANIFEST_ARCNAME = "PACKAGE_MANIFEST.json"
 CHECK_CONFIG_NAME = "release_check.toml"
@@ -89,7 +89,8 @@ class Exit(IntEnum):
     PROBLEMS = 1          # check failures / verification problems
     BAD_PROJECT = 2       # project path missing or not a directory
     OUTPUT_EXISTS = 3     # output ZIP already exists (use --overwrite)
-    OS_ERROR = 4          # OS error while writing, or no verification evidence
+    OS_ERROR = 4          # OS error while writing, source changed mid-package,
+                          # or no verification evidence
     SECRETS = 5           # secrets, or unscannable text, in strict/release mode
     CHECKS_FAILED = 6     # non-secret pre-package release checks failed
     PARTIAL = 7           # sidecar valid but no embedded manifest to verify
@@ -290,6 +291,9 @@ class ScanResult:
     clean_files: list[Path] = field(default_factory=list)
     force_included: list[Path] = field(default_factory=list)
     skipped_symlinks: list[Decision] = field(default_factory=list)
+    # The resolved root this scan was taken against. Cleaning revalidates
+    # every target against it immediately before deleting.
+    project_dir: Path | None = None
 
 
 @dataclass
@@ -301,6 +305,13 @@ class Rules:
     file_patterns: set[str] = field(default_factory=set)      # name-based
     path_patterns: set[str] = field(default_factory=set)      # contain "/"
     include_patterns: set[str] = field(default_factory=set)   # force-include
+    # Ordered precedence (last matching rule wins, as in gitignore). Each
+    # include's position, and every user exclusion with its position, so an
+    # exclusion written *after* a "!" line can defeat it. Built-in rules have
+    # no position: they come first, so any include beats them. An include
+    # with no recorded position (e.g. Rules built directly) is never defeated.
+    include_positions: dict[str, int] = field(default_factory=dict)
+    ordered_excludes: list[tuple[int, str]] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -355,18 +366,67 @@ def split_include_pattern(pattern: str) -> tuple[bool, str]:
     return "/" in pattern, pattern
 
 
+CLI_POSITION = 10**9  # --include always comes after every file rule
+
+
 def is_force_included(file_name: str, rel_posix: str, rules: Rules) -> str | None:
-    """Return the matching --include pattern, or None."""
-    for pattern in rules.include_patterns:
+    """Return the matching force-include pattern that is still in effect, or None.
+
+    An include is in effect unless a user exclusion written later (a later
+    .packagerignore line, or any --exclude after file rules) also matches the
+    path or one of its folders — the last matching rule wins.
+    """
+    for pattern in sorted(rules.include_patterns):
         is_path, clean = split_include_pattern(pattern)
         if not clean:
             continue
         if is_path:
-            if matches_path_pattern(rel_posix, [clean]):
-                return pattern
-        elif fnmatch.fnmatch(file_name, clean):
+            matched = bool(matches_path_pattern(rel_posix, [clean]))
+        else:
+            matched = fnmatch.fnmatch(file_name, clean)
+        if matched and not include_defeated_later(pattern, rel_posix, rules):
             return pattern
     return None
+
+
+_SINGLE_RULE_CACHE: dict[str, "Rules"] = {}
+
+
+def single_exclude_rules(raw_pattern: str) -> "Rules":
+    """Rules holding exactly one user exclusion. Cached; never mutated."""
+    cached = _SINGLE_RULE_CACHE.get(raw_pattern)
+    if cached is None:
+        cached = Rules()
+        add_exclude_pattern(cached, raw_pattern)
+        if len(_SINGLE_RULE_CACHE) > 4096:
+            _SINGLE_RULE_CACHE.clear()
+        _SINGLE_RULE_CACHE[raw_pattern] = cached
+    return cached
+
+
+def exclusion_hits_path(single: "Rules", rel_posix: str, is_dir: bool) -> bool:
+    """True if `single` excludes this path itself or any folder above it."""
+    parts = rel_posix.strip("/").split("/")
+    for depth in range(len(parts), 0, -1):
+        sub = "/".join(parts[:depth])
+        name = parts[depth - 1]
+        if depth == len(parts) and not is_dir:
+            if should_exclude_file(name, sub, single):
+                return True
+        elif should_exclude_dir(name, sub, single):
+            return True
+    return False
+
+
+def include_defeated_later(pattern: str, rel_posix: str, rules: Rules) -> bool:
+    position = rules.include_positions.get(pattern)
+    if position is None:
+        return False
+    return any(
+        exclude_position > position
+        and exclusion_hits_path(single_exclude_rules(raw), rel_posix, is_dir=False)
+        for exclude_position, raw in rules.ordered_excludes
+    )
 
 
 def include_may_reopen_dir(rel_posix: str, rules: Rules) -> str | None:
@@ -501,15 +561,35 @@ def build_rules(
     # .packagerignore lines starting with "!" are force-includes, exactly as if
     # given with --include. "\!" escapes a literal leading "!". The CLI's own
     # --exclude values are never reinterpreted: "!" there stays literal.
-    file_excludes, file_includes = split_ignore_lines(ignore_patterns)
+    # Order is the contract: file lines top to bottom, then --exclude, then
+    # --include. Later wins. Built-ins above have no position, so come first.
+    position = 0
 
-    for raw_pattern in file_excludes + list(extra_excludes):
-        add_exclude_pattern(rules, raw_pattern)
-
-    for raw_include in list(include_patterns) + file_includes:
-        pattern = normalise_pattern(raw_include)
+    def add_include(raw: str, at: int) -> None:
+        pattern = normalise_pattern(raw)
         if pattern and pattern.strip("/"):
             rules.include_patterns.add(pattern)
+            rules.include_positions[pattern] = max(at, rules.include_positions.get(pattern, 0))
+
+    def add_ordered_exclude(raw: str, at: int) -> None:
+        add_exclude_pattern(rules, raw)
+        if normalise_pattern(raw).strip("/"):
+            rules.ordered_excludes.append((at, raw))
+
+    for line in ignore_patterns:
+        position += 1
+        excludes, includes = split_ignore_lines([line])
+        for raw in excludes:
+            add_ordered_exclude(raw, position)
+        for raw in includes:
+            add_include(raw, position)
+
+    for raw_pattern in extra_excludes:
+        position += 1
+        add_ordered_exclude(raw_pattern, position)
+
+    for raw_include in include_patterns:
+        add_include(raw_include, CLI_POSITION)
     return rules
 
 
@@ -564,23 +644,9 @@ def user_rules_excluding(rel_posix: str, is_dir: bool, lines: Iterable[str]) -> 
     bring it back?". Built-in and strict rules are deliberately not reported:
     those cannot be removed, only overridden with a force-include.
     """
-    parts = rel_posix.strip("/").split("/")
-    hits: list[str] = []
     excludes, _ = split_ignore_lines(lines)
-    for line in excludes:
-        single = Rules()
-        add_exclude_pattern(single, line)
-        for depth in range(len(parts), 0, -1):
-            sub = "/".join(parts[:depth])
-            name = parts[depth - 1]
-            if depth == len(parts) and not is_dir:
-                matched = should_exclude_file(name, sub, single)
-            else:
-                matched = should_exclude_dir(name, sub, single)
-            if matched:
-                hits.append(line)
-                break
-    return hits
+    return [line for line in excludes
+            if exclusion_hits_path(single_exclude_rules(line), rel_posix, is_dir)]
 
 
 def user_includes_matching(rel_posix: str, lines: Iterable[str]) -> list[str]:
@@ -642,10 +708,21 @@ class IgnoreFile:
         return line.strip() in self.patterns()
 
     def add(self, line: str) -> bool:
-        """Append a pattern line. Returns False if already present or empty."""
+        """Make `line` the last (winning) rule. Returns False if nothing changed.
+
+        Order matters — the last matching rule wins — so re-adding a rule
+        that already exists earlier moves it to the end rather than doing
+        nothing; otherwise "exclude this" could be silently outranked by a
+        "!" line written after the original.
+        """
         line = line.strip()
-        if not line or line.startswith("#") or self.has(line):
+        if not line or line.startswith("#"):
             return False
+        patterns = self.patterns()
+        if patterns and patterns[-1] == line:
+            return False
+        if line in patterns:
+            self.remove(line)
         self.lines.append(line)
         return True
 
@@ -708,6 +785,9 @@ def suggest_patterns(rel_posix: str, is_dir: bool) -> dict[str, str]:
 # --------------------------------------------------------------------------
 
 
+SIGNATURE_SUFFIX = ".minisig"
+
+
 def reserved_output_paths(output_zip: Path | None) -> set[Path]:
     """Paths the packager is about to write, which it must never archive.
 
@@ -722,6 +802,9 @@ def reserved_output_paths(output_zip: Path | None) -> set[Path]:
         resolved.with_name(resolved.name + ".sha256"),
         resolved.with_name(resolved.name + ".part"),
         resolved.with_name(resolved.name + ".tmp"),
+        resolved.with_name(resolved.name + ".part.sha256"),
+        resolved.with_name(resolved.name + SIGNATURE_SUFFIX),
+        resolved.with_name(resolved.name + SIGNATURE_SUFFIX + ".part"),
     }
 
 
@@ -746,6 +829,7 @@ def scan_project(
     """
     result = ScanResult()
     project_dir = project_dir.resolve()
+    result.project_dir = project_dir
     resolved_output_dir = output_dir.resolve() if output_dir else None
     reserved = reserved_output_paths(output_zip)
 
@@ -1230,15 +1314,24 @@ def scan_for_secrets(project_dir: Path, files: list[Path]) -> SecretScanResult:
         for label, pattern in SECRET_PATTERNS:
             for match in pattern.finditer(text):
                 line = text.count("\n", 0, match.start()) + 1
-                token = match.group(0)
-                preview = token[:10] + "..." if len(token) > 10 else token
-                finding = SecretFinding(rel_path, line, label, preview)
+                finding = SecretFinding(rel_path, line, label, redact(match.group(0)))
                 if line_allows_secret(text, match.start()):
                     result.allowed.append(finding)
                 else:
                     result.findings.append(finding)
 
     return result
+
+
+def redact(token: str) -> str:
+    """A preview that identifies the kind of token without revealing it.
+
+    At most the first four characters — for the supported formats that is the
+    public type prefix (AKIA, ghp_, sk-a, xoxb, AIza, -----), not secret
+    material. v3.0.0 showed ten, i.e. six real characters of an AWS key.
+    """
+    shown = token[:4] if len(token) > 8 else ""
+    return f"{shown}…[{len(token)} chars redacted]"
 
 
 ALLOW_SECRET_MARKER = "packager: allow-secret"
@@ -1262,14 +1355,50 @@ def line_allows_secret(text: str, offset: int) -> bool:
 # --------------------------------------------------------------------------
 
 
+def clean_target_refusal(path: Path, project_dir: Path | None, *, is_dir: bool) -> str | None:
+    """Why this cleaning target must not be deleted right now, or None.
+
+    Paths collected at scan time are not trusted at deletion time: the tree
+    can change in between, and a caller can hand over any list. So every
+    target is re-checked immediately before deletion — inside the project,
+    an approved cache name, the expected type, and not a symlink.
+    """
+    if project_dir is None:
+        return "no project root recorded for this scan"
+    if path.is_symlink():
+        return "is a symlink"
+    if is_dir:
+        if path.name not in CLEAN_DIR_NAMES:
+            return f"name {path.name!r} is not an approved cache directory"
+        if not path.is_dir():
+            return "is no longer a directory"
+    else:
+        if not matches_any_pattern(path.name, CLEAN_FILE_PATTERNS):
+            return f"name {path.name!r} is not an approved cache file"
+        if not path.is_file():
+            return "is no longer a regular file"
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        return f"cannot be resolved: {exc}"
+    if resolved == project_dir or not is_inside(resolved, project_dir):
+        return f"resolves outside the project ({resolved})"
+    return None
+
+
 def remove_clean_targets(scan: ScanResult, *, dry_run: bool) -> tuple[int, int]:
     """Delete cache junk collected during scan. Returns (dirs_removed, files_removed)."""
     dirs_removed = 0
     files_removed = 0
+    root = scan.project_dir
 
     # Delete files first, then dirs.
     for file_path in scan.clean_files:
-        if not file_path.exists():
+        if not file_path.exists() and not file_path.is_symlink():
+            continue
+        refusal = clean_target_refusal(file_path, root, is_dir=False)
+        if refusal:
+            print(f"WARNING: refusing to delete {file_path}: {refusal}", file=sys.stderr)
             continue
         if not dry_run:
             try:
@@ -1281,7 +1410,11 @@ def remove_clean_targets(scan: ScanResult, *, dry_run: bool) -> tuple[int, int]:
 
     # Sort deepest first for predictable cleanup.
     for dir_path in sorted(scan.clean_dirs, key=lambda p: len(p.parts), reverse=True):
-        if not dir_path.exists():
+        if not dir_path.exists() and not dir_path.is_symlink():
+            continue
+        refusal = clean_target_refusal(dir_path, root, is_dir=True)
+        if refusal:
+            print(f"WARNING: refusing to delete {dir_path}: {refusal}", file=sys.stderr)
             continue
         if not dry_run:
             try:
@@ -1313,11 +1446,11 @@ def build_manifest(project_dir: Path, included_files: list[Path]) -> dict:
     total = 0
     for file_path in sorted(included_files):
         rel = normalise_rel(file_path.relative_to(project_dir))
-        try:
-            size = file_path.stat().st_size
-            digest = sha256_of_file(file_path)
-        except OSError:
-            continue
+        # No try/except: a file that vanished or became unreadable between
+        # scanning and hashing must fail the run. Skipping it produced a
+        # manifest that silently omitted a file the user expected to ship.
+        size = file_path.stat().st_size
+        digest = sha256_of_file(file_path)
         total += size
         entries.append({"path": rel, "size": size, "sha256": digest})
 
@@ -1379,6 +1512,19 @@ def assert_contained(project_dir: Path, file_path: Path) -> None:
         )
 
 
+class SourceChangedError(OSError):
+    """A source file's bytes in the archive differ from its manifest entry."""
+
+
+def _stream_sha256(handle) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    count = 0
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+        count += len(chunk)
+    return digest.hexdigest(), count
+
+
 def create_zip(
     project_dir: Path,
     included_files: list[Path],
@@ -1387,7 +1533,14 @@ def create_zip(
     overwrite: bool,
     manifest: dict | None,
 ) -> tuple[int, str, bool]:
-    """Create the ZIP.
+    """Create the ZIP atomically.
+
+    Everything is written to `<zip>.part` and only moved into place once it
+    is complete and self-consistent, so a failed run never leaves a partial
+    archive and never damages an archive it was asked to overwrite. Before
+    the manifest is embedded, every member is read back from the temporary
+    archive and checked against it: the manifest describes the bytes actually
+    written, not the bytes that were on disk a moment earlier.
 
     Returns (total uncompressed bytes, zip sha256, sidecar written).
     """
@@ -1403,67 +1556,108 @@ def create_zip(
     assert_no_reserved_collision(project_dir, included_files)
 
     output_zip.parent.mkdir(parents=True, exist_ok=True)
+    part = output_zip.with_name(output_zip.name + ".part")
+    sidecar = output_zip.with_name(output_zip.name + ".sha256")
+    # Ends in .sha256 deliberately: it *is* a sidecar write, just not yet in
+    # place, and anything that refuses sidecar writes must refuse this one.
+    sidecar_part = output_zip.with_name(output_zip.name + ".part.sha256")
 
-    total_bytes = 0
     try:
-        total_bytes = _write_members(project_dir, included_files, output_zip, manifest)
-    except (ReservedNameError, ContainmentError):
-        # Full atomic replacement lands in v3.1.0. Until then, at least do not
-        # leave a partial archive behind for the failures introduced here.
+        # Our own reserved temporary name: a leftover is from a crashed run.
+        part.unlink(missing_ok=True)
+        total_bytes = _write_members(project_dir, included_files, part)
+        if manifest is not None:
+            _confirm_snapshot(part, manifest)
+            with zipfile.ZipFile(part, "a", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(MANIFEST_ARCNAME, json.dumps(manifest, indent=2, sort_keys=False))
+        zip_digest = sha256_of_file(part)
+    except BaseException:
         try:
-            output_zip.unlink(missing_ok=True)
+            part.unlink(missing_ok=True)
         except OSError:
             pass
         raise
 
-    zip_digest = sha256_of_file(output_zip)
-
-    # Sidecar hash file: "<hash>  <filename>" (sha256sum-compatible).
-    sidecar = output_zip.with_name(output_zip.name + ".sha256")
+    # Sidecar first, to a temporary name, so the archive and its hash are
+    # swapped in back to back. Sidecar format: "<hash>  <filename>".
     sidecar_written = True
     try:
-        sidecar.write_text(f"{zip_digest}  {output_zip.name}\n", encoding="utf-8")
+        sidecar_part.write_text(f"{zip_digest}  {output_zip.name}\n", encoding="utf-8")
     except OSError as exc:
         print(f"WARNING: could not write hash sidecar: {exc}", file=sys.stderr)
         sidecar_written = False
+        try:
+            sidecar_part.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    try:
+        os.replace(part, output_zip)
+        # A signature from an archive we just replaced describes other bytes.
+        # Left in place it would fail verification at best, and mislead at worst.
+        output_zip.with_name(output_zip.name + SIGNATURE_SUFFIX).unlink(missing_ok=True)
+    except BaseException:
+        for leftover in (part, sidecar_part):
+            try:
+                leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+    if sidecar_written:
+        try:
+            os.replace(sidecar_part, sidecar)
+        except OSError as exc:
+            print(f"WARNING: could not write hash sidecar: {exc}", file=sys.stderr)
+            sidecar_written = False
+    if not sidecar_written:
+        # A sidecar from an overwritten archive would now describe the wrong
+        # file. Removing it is honest; leaving it would make verify fail with
+        # a misleading mismatch — or worse, be trusted by a human.
+        try:
+            sidecar.unlink(missing_ok=True)
+            sidecar_part.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     return total_bytes, zip_digest, sidecar_written
 
 
-def _write_members(
-    project_dir: Path,
-    included_files: list[Path],
-    output_zip: Path,
-    manifest: dict | None,
-) -> int:
-    """Write every member into the archive. Returns uncompressed byte total."""
-    total_bytes = 0
-    with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+def _write_members(project_dir: Path, included_files: list[Path], target: Path) -> int:
+    """Write every member into `target`. Returns uncompressed byte total."""
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         written: set[str] = set()
         for file_path in sorted(included_files):
             rel_path = file_path.relative_to(project_dir)
             arcname = normalise_rel(rel_path)
-            if arcname in written:
-                raise ReservedNameError(f"duplicate archive member: {arcname}")
+            if arcname in written or arcname == MANIFEST_ARCNAME:
+                raise ReservedNameError(f"duplicate or reserved archive member: {arcname}")
             assert_contained(project_dir, file_path)
             zf.write(file_path, arcname)
             written.add(arcname)
-            try:
-                total_bytes += file_path.stat().st_size
-            except OSError:
-                pass
+        return sum(info.file_size for info in zf.infolist())
 
-        if manifest is not None:
-            if MANIFEST_ARCNAME in written:
-                raise ReservedNameError(
-                    f"{MANIFEST_ARCNAME} is reserved for the packager's own metadata."
-                )
-            zf.writestr(
-                MANIFEST_ARCNAME,
-                json.dumps(manifest, indent=2, sort_keys=False),
+
+def _confirm_snapshot(part: Path, manifest: dict) -> None:
+    """Every manifest entry must match the member bytes actually written."""
+    expected = {entry["path"]: entry for entry in manifest["files"]}
+    with zipfile.ZipFile(part) as zf:
+        names = [info.filename for info in zf.infolist()]
+        if sorted(names) != sorted(expected):
+            raise SourceChangedError(
+                "archive members do not match the manifest file list "
+                "(a file appeared or disappeared during packaging)"
             )
-
-    return total_bytes
+        for name in names:
+            with zf.open(name) as member:
+                digest, size = _stream_sha256(member)
+            entry = expected[name]
+            if digest != entry["sha256"] or size != entry["size"]:
+                raise SourceChangedError(
+                    f"source changed during packaging: {name} — the bytes written "
+                    "differ from the bytes hashed for the manifest. Re-run when "
+                    "nothing is writing to the project."
+                )
 
 
 # --------------------------------------------------------------------------
@@ -1471,12 +1665,214 @@ def _write_members(
 # --------------------------------------------------------------------------
 
 
-def verify_archive(zip_path: Path) -> int:
+# Hostile-archive limits. Generous for real projects; an archive past them is
+# refused before anything is decompressed.
+VERIFY_MAX_MEMBERS = 200_000
+VERIFY_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
+VERIFY_MAX_EXPANSION_RATIO = 1000            # uncompressed bytes per archive byte
+VERIFY_EXPANSION_FLOOR = 256 * 1024 * 1024   # ratio only applies above this
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+def unsafe_member_reason(name: str) -> str | None:
+    """Why a member name could escape an extraction directory, or None."""
+    if not name:
+        return "empty name"
+    if "\x00" in name:
+        return "contains a NUL byte"
+    if "\\" in name:
+        return "contains a backslash (Windows path separator)"
+    if name.startswith("/"):
+        return "absolute path"
+    if _DRIVE_PREFIX.match(name):
+        return "drive-qualified path"
+    if ".." in name.split("/"):
+        return "parent-directory traversal"
+    return None
+
+
+def validate_manifest(manifest: object) -> list[str]:
+    """Structural problems with a manifest. Empty list means well-formed.
+
+    Checked before any member is compared: a manifest of the wrong shape is
+    one failure, not hundreds of members that each look "not in manifest".
+    """
+    if not isinstance(manifest, dict):
+        return ["manifest is not a JSON object"]
+    errors: list[str] = []
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return ["'files' is missing or not a list"]
+    seen: set[str] = set()
+    for index, entry in enumerate(files):
+        where = f"files[{index}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{where} is not an object")
+            continue
+        path = entry.get("path")
+        size = entry.get("size")
+        digest = entry.get("sha256")
+        if not isinstance(path, str) or not path:
+            errors.append(f"{where}.path is missing or not a string")
+        elif path in seen:
+            errors.append(f"{where}.path is listed twice: {path}")
+        else:
+            seen.add(path)
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            errors.append(f"{where}.size is not a non-negative integer")
+        if not isinstance(digest, str) or not _SHA256_HEX.fullmatch(digest):
+            errors.append(f"{where}.sha256 is not a 64-character hex digest")
+        if len(errors) >= 20:
+            errors.append("... further errors not listed")
+            return errors
+    count = manifest.get("file_count")
+    if isinstance(count, bool) or not isinstance(count, int):
+        errors.append("'file_count' is missing or not an integer")
+    elif count != len(files):
+        errors.append(f"'file_count' says {count} but {len(files)} files are listed")
+    total = manifest.get("total_bytes")
+    if isinstance(total, bool) or not isinstance(total, int):
+        errors.append("'total_bytes' is missing or not an integer")
+    elif not errors and total != sum(e["size"] for e in files):
+        errors.append(f"'total_bytes' says {total} but the listed sizes sum to "
+                      f"{sum(e['size'] for e in files)}")
+    return errors
+
+
+@dataclass
+class ArchiveReport:
+    """Outcome of checking an archive's contents (not its sidecar)."""
+
+    failures: list[str] = field(default_factory=list)
+    has_manifest: bool = False
+    manifest_ok: bool = False
+    ok_count: int = 0
+    listed: int = 0
+    manifest: dict | None = None
+
+
+def inspect_archive(zip_path: Path) -> ArchiveReport:
+    """Check archive contents as untrusted input. Never extracts; streams members.
+
+    Order matters: cheap structural refusals (member count, names, expansion)
+    come before anything is decompressed.
+    """
+    rep = ArchiveReport()
+    fail = rep.failures.append
+    try:
+        archive_size = zip_path.stat().st_size
+        zf = zipfile.ZipFile(zip_path)
+    except (OSError, zipfile.BadZipFile) as exc:
+        fail(f"could not open archive: {exc}")
+        return rep
+
+    with zf:
+        infos = zf.infolist()
+        if len(infos) > VERIFY_MAX_MEMBERS:
+            fail(f"refused: {len(infos)} members exceeds the {VERIFY_MAX_MEMBERS} limit")
+            return rep
+
+        counts: dict[str, int] = {}
+        for info in infos:
+            counts[info.filename] = counts.get(info.filename, 0) + 1
+        for name, count in sorted(counts.items()):
+            if count > 1:
+                fail(f"duplicate member: {name} appears {count} times")
+            reason = unsafe_member_reason(name.rstrip("/") if name.endswith("/") and name != "/" else name)
+            if reason:
+                fail(f"unsafe member path: {name!r} ({reason})")
+
+        limit = max(VERIFY_EXPANSION_FLOOR, archive_size * VERIFY_MAX_EXPANSION_RATIO)
+        stored_total = sum(info.file_size for info in infos)
+        if stored_total > limit:
+            fail(f"refused: members expand to {format_bytes(stored_total)} from a "
+                 f"{format_bytes(archive_size)} archive (implausible expansion)")
+            return rep
+
+        if MANIFEST_ARCNAME not in counts:
+            return rep
+        rep.has_manifest = True
+
+        manifest_info = zf.getinfo(MANIFEST_ARCNAME)
+        if manifest_info.file_size > VERIFY_MAX_MANIFEST_BYTES:
+            fail(f"refused: manifest is {format_bytes(manifest_info.file_size)} "
+                 f"(limit {format_bytes(VERIFY_MAX_MANIFEST_BYTES)})")
+            return rep
+        try:
+            manifest = json.loads(zf.read(MANIFEST_ARCNAME))
+        except (ValueError, zipfile.BadZipFile, OSError) as exc:
+            fail(f"malformed manifest: not readable JSON ({exc})")
+            return rep
+
+        problems = validate_manifest(manifest)
+        if problems:
+            for problem in problems:
+                fail(f"malformed manifest: {problem}")
+            return rep
+        rep.manifest = manifest
+        entries = manifest["files"]
+        rep.listed = len(entries)
+
+        if manifest["total_bytes"] > limit:
+            fail(f"refused: manifest declares {format_bytes(manifest['total_bytes'])} "
+                 f"from a {format_bytes(archive_size)} archive (implausible size)")
+            return rep
+
+        by_name = {info.filename: info for info in infos}
+        start_failures = len(rep.failures)
+        for entry in entries:
+            path = entry["path"]
+            reason = unsafe_member_reason(path)
+            if reason and counts.get(path, 0) == 0:
+                fail(f"unsafe member path in manifest: {path!r} ({reason})")
+            if path not in by_name:
+                fail(f"missing from archive: {path}")
+                continue
+            if counts[path] > 1:
+                continue  # already failed as a duplicate; which copy is real is unknowable
+            info = by_name[path]
+            if info.file_size != entry["size"]:
+                fail(f"size mismatch: {path} (manifest {entry['size']}, "
+                     f"archive {info.file_size})")
+                continue
+            try:
+                with zf.open(info) as member:
+                    digest, streamed = _stream_sha256(member)
+            except (zipfile.BadZipFile, OSError, EOFError, ValueError) as exc:
+                fail(f"corrupt member: {path} ({exc})")
+                continue
+            except Exception as exc:  # zlib.error and friends
+                fail(f"corrupt member: {path} ({type(exc).__name__}: {exc})")
+                continue
+            if streamed != entry["size"]:
+                fail(f"size mismatch: {path} (manifest {entry['size']}, read {streamed})")
+            elif digest != entry["sha256"]:
+                fail(f"hash mismatch: {path}")
+            else:
+                rep.ok_count += 1
+
+        listed = {entry["path"] for entry in entries}
+        for name in sorted(counts):
+            if name.endswith("/") or name == MANIFEST_ARCNAME or name in listed:
+                continue
+            fail(f"not in manifest: {name}")
+
+        rep.manifest_ok = not rep.failures and len(rep.failures) == start_failures
+    return rep
+
+
+def verify_archive(zip_path: Path, *, pubkey: str | None = None,
+                   pubkey_string: str | None = None) -> int:
     """Check a ZIP against its embedded manifest and .sha256 sidecar.
 
     Tracks *positive evidence*, not merely the absence of detected failures.
     An archive with no trusted hash and no manifest has been checked against
     nothing at all, and saying so is the only honest result.
+
+    The archive is treated as hostile input: duplicate and unsafe member
+    names, malformed manifests, size disagreements, and implausible expansion
+    all fail, and members are hashed as streams, never read whole.
 
     Returns:
         0  every available check passed
@@ -1489,12 +1885,10 @@ def verify_archive(zip_path: Path) -> int:
         return EXIT_PROBLEMS
 
     failures = 0
-    sidecar_verified = False   # a trusted hash matched the archive as a whole
-    manifest_verified = False  # contents matched the archive's own manifest
+    sidecar_verified = False
     print()
     print(f"Verifying: {zip_path.name}")
 
-    # Sidecar check.
     sidecar = zip_path.with_name(zip_path.name + ".sha256")
     if sidecar.is_file():
         try:
@@ -1504,83 +1898,75 @@ def verify_archive(zip_path: Path) -> int:
                 print(f"  OK    sidecar hash matches ({actual[:16]}...)")
                 sidecar_verified = True
             else:
-                print(f"  FAIL  sidecar hash mismatch")
+                print("  FAIL  sidecar hash mismatch")
                 print(f"        expected {expected}")
                 print(f"        actual   {actual}")
                 failures += 1
-        except (OSError, IndexError) as exc:
+        except (OSError, IndexError, UnicodeDecodeError) as exc:
             print(f"  WARN  could not read sidecar: {exc}")
     else:
-        print(f"  WARN  no .sha256 sidecar found")
+        print("  WARN  no .sha256 sidecar found")
 
-    # Manifest check.
-    try:
-        with zipfile.ZipFile(zip_path) as zf:
-            names = set(zf.namelist())
-            if MANIFEST_ARCNAME not in names:
-                print(f"  WARN  no {MANIFEST_ARCNAME} embedded")
-                print()
-                if failures:
-                    print(f"RESULT: FAIL — {failures} problem(s) found.")
-                    return EXIT_PROBLEMS
-                if not sidecar_verified:
-                    print("RESULT: FAIL — nothing could be checked.")
-                    print("        No trusted sidecar hash and no embedded "
-                          "manifest: this archive")
-                    print("        carries no evidence about its own contents.")
-                    return EXIT_PROBLEMS
-                print("RESULT: PARTIAL — the sidecar hash matched, so the archive "
-                      "matches the")
-                print("        hash it was distributed with, but it contains no "
-                      "manifest to")
-                print("        check its individual members against.")
-                return EXIT_PARTIAL
+    signature_verified = False
+    signature_file = zip_path.with_name(zip_path.name + SIGNATURE_SUFFIX)
+    if pubkey or pubkey_string:
+        ok, detail = check_signature(zip_path, pubkey, pubkey_string)
+        if ok:
+            print("  OK    signature verified" + (f" — trusted comment: {detail}" if detail else ""))
+            signature_verified = True
+        else:
+            print(f"  FAIL  signature: {detail}")
+            failures += 1
+    elif signature_file.is_file():
+        print(f"  WARN  {signature_file.name} present but not checked — "
+              "pass --pubkey to verify who made this archive")
 
-            manifest = json.loads(zf.read(MANIFEST_ARCNAME))
-            entries = manifest.get("files", [])
-            print(f"  Manifest: {manifest.get('project', '?')} — "
-                  f"{manifest.get('file_count', len(entries))} file(s), "
-                  f"created {manifest.get('created_utc', '?')}")
-
-            ok_count = 0
-            for entry in entries:
-                arcname = entry.get("path", "")
-                if arcname not in names:
-                    print(f"  FAIL  missing from archive: {arcname}")
-                    failures += 1
-                    continue
-                digest = hashlib.sha256(zf.read(arcname)).hexdigest()
-                if digest != entry.get("sha256"):
-                    print(f"  FAIL  hash mismatch: {arcname}")
-                    failures += 1
-                else:
-                    ok_count += 1
-
-            extras = names - {e.get("path") for e in entries} - {MANIFEST_ARCNAME}
-            extras = {n for n in extras if not n.endswith("/")}
-            for extra in sorted(extras):
-                print(f"  FAIL  not in manifest: {extra}")
-                failures += 1
-
-            print(f"  {ok_count}/{len(entries)} file hashes verified")
-            if not failures:
-                manifest_verified = True
-    except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
-        print(f"  FAIL  could not verify archive: {exc}")
-        failures += 1
+    report = inspect_archive(zip_path)
+    if report.manifest is not None:
+        m = report.manifest
+        print(f"  Manifest: {m.get('project', '?')} — {m['file_count']} file(s), "
+              f"created {m.get('created_utc', '?')}")
+    for line in report.failures[:200]:
+        print(f"  FAIL  {line}")
+    if len(report.failures) > 200:
+        print(f"  FAIL  ... and {len(report.failures) - 200} more problem(s)")
+    failures += len(report.failures)
+    if report.manifest is not None:
+        print(f"  {report.ok_count}/{report.listed} file hashes verified")
 
     print()
+    if not report.has_manifest and not report.failures:
+        print(f"  WARN  no {MANIFEST_ARCNAME} embedded")
+        print()
+        if failures:
+            print(f"RESULT: FAIL — {failures} problem(s) found.")
+            return EXIT_PROBLEMS
+        if not sidecar_verified:
+            print("RESULT: FAIL — nothing could be checked.")
+            print("        No trusted sidecar hash and no embedded manifest: this archive")
+            print("        carries no evidence about its own contents.")
+            return EXIT_PROBLEMS
+        print("RESULT: PARTIAL — the sidecar hash matched, so the archive matches the")
+        print("        hash it was distributed with, but it contains no manifest to")
+        print("        check its individual members against.")
+        return EXIT_PARTIAL
+
     if failures:
         print(f"RESULT: FAIL — {failures} problem(s) found.")
         return EXIT_PROBLEMS
-    if not (sidecar_verified or manifest_verified):
+    if not (sidecar_verified or report.manifest_ok):
         print("RESULT: FAIL — nothing could be checked.")
         return EXIT_PROBLEMS
-    if manifest_verified and not sidecar_verified:
+    if report.manifest_ok and not sidecar_verified and signature_verified:
+        print("RESULT: OK — archive verified against its signature and manifest.")
+        return EXIT_OK
+    if report.manifest_ok and not sidecar_verified:
         print("RESULT: OK — archive is internally consistent with its own manifest.")
-        print("        No trusted sidecar hash was available, so this shows the "
-              "archive is")
+        print("        No trusted sidecar hash was available, so this shows the archive is")
         print("        self-consistent, not that it is the archive you were sent.")
+        return EXIT_OK
+    if signature_verified:
+        print("RESULT: OK — archive verified against its signature, sidecar hash and manifest.")
         return EXIT_OK
     print("RESULT: OK — archive verified against its sidecar hash and manifest.")
     return EXIT_OK
@@ -1874,32 +2260,21 @@ def run_builtin_checks(
     try:
         with zipfile.ZipFile(latest) as zf:
             names = zf.namelist()
-            junk = [
-                n for n in names
-                if matches_any_pattern(Path(n).name, DEBRIS_FILE_PATTERNS)
-            ]
-            report.check("ZIP contains no debris entries", len(junk) == 0,
-                         ", ".join(junk[:5]))
-            if MANIFEST_ARCNAME in names:
-                manifest = json.loads(zf.read(MANIFEST_ARCNAME))
-                bad = 0
-                for entry in manifest.get("files", []):
-                    arc = entry.get("path", "")
-                    if arc not in names:
-                        bad += 1
-                        continue
-                    if hashlib.sha256(zf.read(arc)).hexdigest() != entry.get("sha256"):
-                        bad += 1
-                report.check(
-                    f"ZIP manifest hashes verify ({len(manifest.get('files', []))} files)",
-                    bad == 0,
-                    f"{bad} mismatch(es)",
-                )
-            else:
-                report.warn("ZIP has embedded manifest", False,
-                            f"no {MANIFEST_ARCNAME} (older package?)")
-    except (OSError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+    except (OSError, zipfile.BadZipFile) as exc:
         report.check("ZIP is readable", False, str(exc))
+        return
+    junk = [n for n in names if matches_any_pattern(Path(n).name, DEBRIS_FILE_PATTERNS)]
+    report.check("ZIP contains no debris entries", len(junk) == 0, ", ".join(junk[:5]))
+    inspection = inspect_archive(latest)
+    if inspection.has_manifest or inspection.failures:
+        report.check(
+            f"ZIP verifies against its manifest ({inspection.listed} files)",
+            not inspection.failures,
+            "; ".join(inspection.failures[:3]),
+        )
+    else:
+        report.warn("ZIP has embedded manifest", False,
+                    f"no {MANIFEST_ARCNAME} (older package?)")
 
 
 def run_config_checks(
@@ -2016,11 +2391,26 @@ def run_config_checks(
         report.section("Wheel build")
         timeout = int(wheel_cfg.get("timeout", 300))
         with tempfile.TemporaryDirectory() as tmpdir:
+            # Build from a copy: setuptools writes build/ and *.egg-info into
+            # the source tree, and `check` promises never to modify anything.
+            # VCS, venvs, caches and old build output are left behind; links
+            # are copied as links, never followed.
+            source = Path(tmpdir) / "src"
+            wheel_dir = Path(tmpdir) / "wheels"
+            try:
+                shutil.copytree(
+                    project_dir, source, symlinks=True,
+                    ignore=shutil.ignore_patterns(*sorted(CHECK_PRUNE_DIR_NAMES),
+                                                  *sorted(DEFAULT_EXCLUDE_DIR_PATTERNS)),
+                )
+            except (OSError, shutil.Error) as exc:
+                report.check("Wheel builds successfully", False, f"could not copy project: {exc}")
+                return
             try:
                 result = subprocess.run(
                     [sys.executable, "-m", "pip", "wheel", ".", "--no-deps",
-                     "-w", tmpdir, "--quiet"],
-                    capture_output=True, text=True, cwd=project_dir, timeout=timeout,
+                     "-w", str(wheel_dir), "--quiet"],
+                    capture_output=True, text=True, cwd=source, timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
                 report.check("Wheel builds successfully", False,
@@ -2030,7 +2420,7 @@ def run_config_checks(
                 report.check("Wheel builds successfully", False,
                              (result.stderr or result.stdout)[:200].strip())
                 return
-            wheels = sorted(Path(tmpdir).glob("*.whl"))
+            wheels = sorted(wheel_dir.glob("*.whl"))
             if not wheels:
                 report.check("Wheel found after build", False, "no .whl produced")
                 return
@@ -2402,7 +2792,8 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    return verify_archive(Path(args.zip).expanduser().resolve())
+    return verify_archive(Path(args.zip).expanduser().resolve(),
+                          pubkey=args.pubkey, pubkey_string=args.pubkey_string)
 
 
 # --------------------------------------------------------------------------
@@ -2578,14 +2969,18 @@ def listing_from_zip(zip_path: Path) -> Listing:
     with zipfile.ZipFile(zip_path) as zf:
         names = [n for n in zf.namelist() if not n.endswith("/")]
         if MANIFEST_ARCNAME in names:
+            if zf.getinfo(MANIFEST_ARCNAME).file_size > VERIFY_MAX_MANIFEST_BYTES:
+                raise ValueError(f"{zip_path.name}: manifest too large")
             try:
                 manifest = json.loads(zf.read(MANIFEST_ARCNAME))
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 raise ValueError(f"{zip_path.name}: unreadable manifest: {exc}") from exc
-            files: dict[str, tuple[int, str]] = {}
-            for entry in manifest.get("files", []) if isinstance(manifest, dict) else []:
-                if isinstance(entry, dict) and isinstance(entry.get("path"), str):
-                    files[entry["path"]] = (int(entry.get("size") or 0), str(entry.get("sha256", "")))
+            problems = validate_manifest(manifest)
+            if problems:
+                raise ValueError(f"{zip_path.name}: malformed manifest: {problems[0]}")
+            files: dict[str, tuple[int, str]] = {
+                entry["path"]: (entry["size"], entry["sha256"]) for entry in manifest["files"]
+            }
             return Listing(zip_path.name, "manifest", files, str(manifest.get("created_utc", "")))
         files = {}
         for name in names:
@@ -2688,6 +3083,102 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# Detached signatures (optional; minisign)
+# --------------------------------------------------------------------------
+#
+# The sidecar and manifest show an archive is intact; they cannot show who
+# made it, because anyone who can replace the ZIP can replace them too. A
+# minisign signature can: only the holder of the secret key can produce one.
+# minisign is an external tool and is never required unless asked for.
+
+
+class SigningError(Exception):
+    """Signing was requested but cannot be done."""
+
+
+def find_minisign() -> str | None:
+    return shutil.which("minisign")
+
+
+def signing_preflight(sign_key: str | None) -> tuple[str, Path | None]:
+    """Check signing can work *before* anything is written. Returns (exe, key)."""
+    exe = find_minisign()
+    if not exe:
+        raise SigningError(
+            "--sign needs minisign, which is not on PATH.\n"
+            "Install it (Windows: `winget install jedisct1.minisign` or "
+            "`scoop install minisign`), or drop --sign."
+        )
+    if sign_key:
+        key = Path(sign_key).expanduser()
+        if not key.is_file():
+            raise SigningError(f"secret key not found: {key}")
+        return exe, key
+    default = Path.home() / ".minisign" / "minisign.key"
+    if not default.is_file():
+        raise SigningError(
+            f"no secret key at {default}. Create one with `minisign -G`, "
+            "or pass --sign-key PATH."
+        )
+    return exe, None
+
+
+def sign_archive(exe: str, key: Path | None, zip_path: Path, digest: str) -> Path:
+    """Write <zip>.minisig atomically. minisign may prompt for the key password."""
+    signature = zip_path.with_name(zip_path.name + SIGNATURE_SUFFIX)
+    part = signature.with_name(signature.name + ".part")
+    comment = f"{TOOL_NAME} {TOOL_VERSION} file:{zip_path.name} sha256:{digest}"
+    cmd = [exe, "-S", "-m", str(zip_path), "-x", str(part), "-t", comment]
+    if key is not None:
+        cmd += ["-s", str(key)]
+    try:
+        part.unlink(missing_ok=True)
+        # stdin/stdout inherited so a password prompt reaches the user.
+        result = subprocess.run(cmd, timeout=300)
+        if result.returncode != 0 or not part.is_file():
+            raise SigningError(f"minisign exited {result.returncode}")
+        os.replace(part, signature)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        part.unlink(missing_ok=True)
+        raise SigningError(str(exc)) from exc
+    except SigningError:
+        part.unlink(missing_ok=True)
+        raise
+    return signature
+
+
+def check_signature(zip_path: Path, pubkey_file: str | None,
+                    pubkey_string: str | None) -> tuple[bool, str]:
+    """Verify <zip>.minisig with minisign. Returns (ok, detail)."""
+    exe = find_minisign()
+    if not exe:
+        return False, "minisign is not on PATH, so the signature cannot be checked"
+    signature = zip_path.with_name(zip_path.name + SIGNATURE_SUFFIX)
+    if not signature.is_file():
+        return False, f"no {signature.name} found — the archive is unsigned"
+    cmd = [exe, "-V", "-m", str(zip_path), "-x", str(signature)]
+    if pubkey_string:
+        cmd += ["-P", pubkey_string]
+    else:
+        key = Path(pubkey_file).expanduser()  # type: ignore[arg-type]
+        if not key.is_file():
+            return False, f"public key not found: {key}"
+        cmd += ["-p", str(key)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                                stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"could not run minisign: {exc}"
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        return False, (" ".join(line.strip() for line in output.splitlines() if line.strip())
+                       or f"minisign exited {result.returncode}")
+    trusted = next((line.split(":", 1)[1].strip() for line in output.splitlines()
+                    if line.lower().startswith("trusted comment:")), "")
+    return True, trusted
+
+
+# --------------------------------------------------------------------------
 # Subcommand: package
 # --------------------------------------------------------------------------
 
@@ -2715,6 +3206,16 @@ def cmd_package(args: argparse.Namespace) -> int:
     if not project_dir.is_dir():
         print(f"ERROR: project path is not a directory: {project_dir}", file=sys.stderr)
         return EXIT_BAD_PROJECT
+
+    # Before anything is written or cleaned: a signature that was asked for
+    # and cannot be made must not be discovered after the fact.
+    signer: tuple[str, Path | None] | None = None
+    if args.sign and not args.dry_run:
+        try:
+            signer = signing_preflight(args.sign_key)
+        except SigningError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return EXIT_OS_ERROR
 
     if run_checks_first:
         try:
@@ -2779,17 +3280,9 @@ def cmd_package(args: argparse.Namespace) -> int:
     cleaned_dirs = 0
     cleaned_files = 0
 
-    # Replacement is not atomic until v3.1.0, so a failed write can destroy a
-    # good archive. Refused where that matters most, unless stated explicitly.
-    if args.overwrite and fail_on_secrets and not args.force:
-        print(
-            "ERROR: --overwrite is refused in strict/release mode because archive "
-            "replacement\nis not yet atomic (scheduled for v3.1.0): a failed write "
-            "can destroy the\nexisting archive. Use a new --name, or accept the "
-            "risk with --force.",
-            file=sys.stderr,
-        )
-        return EXIT_OUTPUT_EXISTS
+    # --overwrite used to be refused in strict/release mode because a failed
+    # write could destroy the existing archive. Writing is now atomic (temp
+    # file, then replace), so a failure leaves the previous archive intact.
 
     if not scan_secrets and fail_on_secrets and not args.force:
         print(
@@ -2910,7 +3403,15 @@ def cmd_package(args: argparse.Namespace) -> int:
     zip_sha256 = ""
     sidecar_written = True
     if not args.dry_run:
-        manifest = None if args.no_manifest else build_manifest(project_dir, scan.included_files)
+        try:
+            manifest = (
+                None if args.no_manifest else build_manifest(project_dir, scan.included_files)
+            )
+        except OSError as exc:
+            print(f"ERROR: could not hash a file for the manifest: {exc}\n"
+                  "Was something deleted or locked during packaging? Nothing was written.",
+                  file=sys.stderr)
+            return EXIT_OS_ERROR
         try:
             zip_uncompressed_bytes, zip_sha256, sidecar_written = create_zip(
                 project_dir,
@@ -2974,6 +3475,19 @@ def cmd_package(args: argparse.Namespace) -> int:
         )
         return EXIT_OS_ERROR
 
+    if signer is not None:
+        try:
+            signature = sign_archive(signer[0], signer[1], output_zip, zip_sha256)
+        except SigningError as exc:
+            print(
+                f"ERROR: the archive was written and verified, but NOT signed: {exc}\n"
+                f"Sign it later with:  minisign -Sm \"{output_zip}\"",
+                file=sys.stderr,
+            )
+            return EXIT_OS_ERROR
+        print(f"Signature:               {signature.name}")
+        print()
+
     if args.open and not args.dry_run:
         open_folder(output_dir)
 
@@ -2989,7 +3503,7 @@ EXIT_MEANINGS: dict[int, str] = {
     Exit.PROBLEMS: "checks failed, or verification found a fault",
     Exit.BAD_PROJECT: "project path missing or not a directory",
     Exit.OUTPUT_EXISTS: "that ZIP already exists — tick Overwrite or change the name",
-    Exit.OS_ERROR: "write error, or no verification evidence",
+    Exit.OS_ERROR: "write error, a file changed mid-package, or no verification evidence",
     Exit.SECRETS: "blocked: secrets, or text that could not be scanned",
     Exit.CHECKS_FAILED: "blocked: release checks failed — run checks for detail",
     Exit.PARTIAL: "partial: hash matched, but no manifest to check against",
@@ -3673,7 +4187,7 @@ class PackagerGUI:
                 var.set("")
             self._set_status(f"Added rule  {line}")
         else:
-            self._set_status(f"Rule already present: {line}")
+            self._set_status(f"Already the last rule: {line}")
 
     def remove_rules(self, lb, prefix: str) -> None:
         lines = [prefix + lb.get(i) for i in lb.curselection()]
@@ -4088,11 +4602,8 @@ class PackagerGUI:
                 self._change_rules(lambda ig: ig.remove(sugg["include_this"]))
                 self._set_status(f"Removed {sugg['include_this']}")
             else:
+                # Appended last, so it outranks the broader "!" rule above it.
                 self.add_rule(sugg["exclude_this"])
-                if own:
-                    self._set_status(
-                        f"Also force-included by {', '.join('!' + o for o in own)} — "
-                        "remove that rule to exclude it")
         else:  # excluded / inherited
             if sugg["exclude_this"] in lines:
                 self._change_rules(lambda ig: ig.remove(sugg["exclude_this"]))
@@ -4471,6 +4982,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Package anyway despite secret findings or failed checks.")
     p.add_argument("--overwrite", action="store_true",
                    help="Allow overwriting an existing ZIP of the same name.")
+    p.add_argument("--sign", action="store_true",
+                   help="Write a minisign signature (<zip>.minisig). Needs minisign "
+                        "on PATH; checked before anything is written.")
+    p.add_argument("--sign-key", metavar="FILE", default=None,
+                   help="minisign secret key (default: ~/.minisign/minisign.key).")
     p.add_argument("--open", action="store_true",
                    help="Open the output folder when done.")
     p.add_argument("--list-included", action="store_true",
@@ -4494,6 +5010,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Verify a ZIP against its embedded manifest and .sha256 sidecar.",
     )
     v.add_argument("zip", help="Path to the ZIP to verify.")
+    vk = v.add_mutually_exclusive_group()
+    vk.add_argument("--pubkey", metavar="FILE",
+                    help="Also verify <zip>.minisig against this minisign public key.")
+    vk.add_argument("--pubkey-string", metavar="KEY",
+                    help="As --pubkey, with the key given inline (RW...).")
     v.set_defaults(func=cmd_verify)
 
     # -- init --------------------------------------------------------------
@@ -4567,6 +5088,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # Backward compatibility: `project_packager.py .` still packages.
     if raw and raw[0] not in KNOWN_COMMANDS and not raw[0].startswith("-"):
+        # ...but a typo of a command name that is not an existing folder is
+        # almost certainly a typo. Same exit code as before (2: no such
+        # project), now with a hint instead of a confusing path error.
+        import difflib
+
+        guess = difflib.get_close_matches(raw[0], sorted(KNOWN_COMMANDS), n=1, cutoff=0.6)
+        if guess and not Path(raw[0]).expanduser().exists():
+            print(f"ERROR: '{raw[0]}' is not a command or an existing folder. "
+                  f"Did you mean '{guess[0]}'?", file=sys.stderr)
+            return EXIT_BAD_PROJECT
         raw = ["package"] + raw
     elif not raw:
         raw = ["package"]

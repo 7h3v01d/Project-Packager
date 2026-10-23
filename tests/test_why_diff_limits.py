@@ -166,14 +166,11 @@ def test_why_missing_path_exits_1(tmp_path, capsys):
     assert code == pp.EXIT_PROBLEMS and "NOT FOUND" in out
 
 
-def test_why_symlink(tmp_path, capsys):
+def test_why_symlink(tmp_path, capsys, needs_symlinks):
     proj = make(tmp_path, {"a.py": ""})
     target = tmp_path / "outside.txt"
     target.write_text("x", encoding="utf-8")
-    try:
-        os.symlink(target, proj / "link.txt")
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
+    os.symlink(target, proj / "link.txt")
     _, out, _ = run(capsys, "why", "link.txt", "-p", str(proj))
     assert "SKIPPED" in out and "cannot be overridden" in out
 
@@ -294,3 +291,41 @@ def test_gui_remembers_per_project_choices(tmp_path):
         assert not (proj / "gui.json").exists()
     finally:
         app2.root.destroy()
+
+
+# -- check is read-only, even when it builds a wheel ------------------------------
+
+def test_wheel_check_never_writes_into_the_project(tmp_path, capsys, monkeypatch):
+    """setuptools builds in place (build/, *.egg-info). `check` promises never
+    to modify the project, so the wheel must be built from a copy.
+
+    pip is faked so the test needs no network: it behaves like setuptools,
+    writing build debris into its working directory and a wheel into -w.
+    """
+    proj = make(tmp_path, {
+        "release_check.toml": '[wheel]\nbuild = true\nmust_contain = ["mod.py"]\n',
+        "pyproject.toml": "[project]\nname='m'\n", "mod.py": "",
+    })
+    before = sorted(p.relative_to(proj).as_posix() for p in proj.rglob("*"))
+    seen = {}
+
+    class Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(cmd, cwd=None, **kwargs):
+        seen["cwd"] = Path(cwd)
+        (Path(cwd) / "build").mkdir()
+        (Path(cwd) / "m.egg-info").mkdir()
+        out = Path(cmd[cmd.index("-w") + 1])
+        out.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(out / "m-0-py3-none-any.whl", "w") as zf:
+            zf.writestr("mod.py", "")
+        return Done()
+
+    monkeypatch.setattr(pp.subprocess, "run", fake_run)
+    code, out, _ = run(capsys, "check", str(proj))
+    assert "OK    Wheel builds successfully" in out
+    assert "OK    Wheel contains mod.py" in out
+    assert seen["cwd"].resolve() != proj.resolve()
+    after = sorted(p.relative_to(proj).as_posix() for p in proj.rglob("*"))
+    assert after == before, f"check modified the project: {set(after) ^ set(before)}"

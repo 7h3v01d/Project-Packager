@@ -118,8 +118,6 @@ def test_packagerignore_rules_are_applied(demo_project: Path, out_dir: Path) -> 
     assert "large_data" in excluded
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_later_rules_override_earlier_rules(demo_project: Path, out_dir: Path) -> None:
     """Legacy test 6, adapted — report: 'later rules override earlier rules'.
 
@@ -132,6 +130,12 @@ def test_later_rules_override_earlier_rules(demo_project: Path, out_dir: Path) -
 
     result = scan(demo_project, ignore_patterns=patterns, output_dir=out_dir)
     assert "run.log" in rel_included(result, demo_project)
+
+    # The converse is what makes this *ordering* rather than "! always wins".
+    write(demo_project / ".packagerignore", "!run.log\n*.log\n")
+    patterns, _ = pkg.load_ignore_file(demo_project)
+    result = scan(demo_project, ignore_patterns=patterns, output_dir=out_dir)
+    assert "run.log" not in rel_included(result, demo_project)
 
 
 def test_clean_targets_are_collected_not_deleted(demo_project: Path, out_dir: Path) -> None:

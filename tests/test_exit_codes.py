@@ -164,16 +164,21 @@ def test_version_flag_reports_the_single_source_of_truth(capsys) -> None:
     assert pkg.TOOL_VERSION in capsys.readouterr().out
 
 
-def test_mistyped_subcommand_falls_through_to_package() -> None:
-    """Documents a consequence of the bare-path compatibility shim.
-
-    main() prepends "package" to any first argument that is not a known
-    subcommand and does not start with "-", so a typo like `chekc` is treated
-    as a project path and exits 2 rather than producing a usage error. Worth
-    revisiting in v3.1.0, but locking in the current behaviour so a rule-engine
-    or CLI change does not alter it unnoticed.
-    """
+def test_mistyped_subcommand_falls_through_to_package(capsys) -> None:
+    """A typo of a command name keeps exit 2 (the compatibility shim treats a
+    bare word as a project path), but since v3.1.0 says what was probably
+    meant instead of reporting a missing project folder."""
     assert pkg.main(["chekc"]) == 2
+    assert "Did you mean 'check'?" in capsys.readouterr().err
+
+
+def test_folder_named_like_a_command_typo_still_packages(tmp_path, monkeypatch) -> None:
+    """The hint must never shadow a real folder: `chekc/` is a project."""
+    project = tmp_path / "chekc"
+    project.mkdir()
+    (project / "a.py").write_text("x\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert pkg.main(["chekc", "--dry-run"]) == 0
 
 
 def test_flag_before_subcommand_is_rejected() -> None:

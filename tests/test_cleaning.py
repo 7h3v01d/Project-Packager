@@ -126,8 +126,6 @@ def test_cleaning_does_not_follow_a_symlinked_cache(
     assert (outside_cache / "important.pyc").is_file()
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_cleaning_refuses_a_target_that_moved_outside_the_project(
     demo_project: Path, tmp_path: Path, out_dir: Path
 ) -> None:
@@ -144,8 +142,6 @@ def test_cleaning_refuses_a_target_that_moved_outside_the_project(
     assert outsider.is_dir(), "deletion outside the project root must be refused"
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_cleaning_refuses_a_target_with_an_unapproved_name(
     demo_project: Path, out_dir: Path
 ) -> None:
@@ -203,17 +199,23 @@ def test_secret_failure_does_not_clean_the_project(clean_project: Path, out_dir:
 
 
 def test_refused_overwrite_does_not_clean_the_project(clean_project: Path, out_dir: Path) -> None:
+    """A release that is refused — here for a secret — must not clean, and
+    must not touch the archive it was asked to overwrite. (Until v3.1.0 the
+    overwrite itself was the refusal; replacement is now atomic.)"""
     cache = clean_project / "__pycache__"
     cache.mkdir()
     (cache / "a.pyc").write_text("cache\n", encoding="utf-8")
-    (out_dir / pkg.build_zip_name(clean_project, "rel")).write_bytes(b"previous")
+    write(clean_project / "leak.py", 'K = "AKIA' + 'ABCDEFGHIJKLMNOP"\n')
+    previous = out_dir / pkg.build_zip_name(clean_project, "rel")
+    previous.write_bytes(b"previous")
 
     code = pkg.main(
         ["package", str(clean_project), "--profile", "release", "--output", str(out_dir),
          "--name", "rel", "--overwrite"]
     )
-    assert code != 0
+    assert code == 5
     assert cache.is_dir()
+    assert previous.read_bytes() == b"previous"
 
 
 def test_successful_release_still_cleans(clean_project: Path, out_dir: Path) -> None:

@@ -116,8 +116,9 @@ def test_added_member_fails(demo_project: Path, out_dir: Path) -> None:
     assert pkg.verify_archive(zip_path) == 1
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
+# Building the hostile archive makes zipfile warn about the duplicate it was
+# asked to write. Expected, and not detection: the assertion is on our FAIL line.
+@pytest.mark.filterwarnings("ignore:Duplicate name:UserWarning")
 def test_duplicate_member_fails(demo_project: Path, out_dir: Path, capsys) -> None:
     """v3.0.0 happens to fail this via a hash mismatch, because ZipFile.read
     returns the last member of that name. That is an accident of the stdlib,
@@ -140,8 +141,6 @@ def test_duplicate_member_fails(demo_project: Path, out_dir: Path, capsys) -> No
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def write_member_verbatim(zf, name: str, data: bytes) -> None:
     """Write a member under exactly this name, bypassing normalisation.
 
@@ -158,8 +157,6 @@ def write_member_verbatim(zf, name: str, data: bytes) -> None:
     zf.writestr(info, data)
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 @pytest.mark.parametrize(
     "hostile_name",
     [
@@ -278,8 +275,6 @@ def test_malformed_manifest_fails(demo_project: Path, out_dir: Path) -> None:
     assert pkg.verify_archive(zip_path) == 1
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 @pytest.mark.parametrize(
     "broken",
     [
@@ -310,8 +305,6 @@ def test_manifest_with_wrong_types_fails(
     )
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_file_count_disagreement_fails(demo_project: Path, out_dir: Path) -> None:
     zip_path = build_package(demo_project, out_dir)
     manifest = load_manifest(zip_path)
@@ -320,8 +313,6 @@ def test_file_count_disagreement_fails(demo_project: Path, out_dir: Path) -> Non
     assert pkg.verify_archive(zip_path) == 1
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_total_bytes_disagreement_fails(demo_project: Path, out_dir: Path) -> None:
     zip_path = build_package(demo_project, out_dir)
     manifest = load_manifest(zip_path)
@@ -330,8 +321,6 @@ def test_total_bytes_disagreement_fails(demo_project: Path, out_dir: Path) -> No
     assert pkg.verify_archive(zip_path) == 1
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_per_file_size_disagreement_fails(demo_project: Path, out_dir: Path) -> None:
     """Content hash can match while the declared size lies."""
     zip_path = build_package(demo_project, out_dir)
@@ -362,8 +351,6 @@ def test_missing_manifest_is_a_distinct_partial_result(demo_project: Path, out_d
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_absurd_member_count_is_refused(demo_project: Path, out_dir: Path) -> None:
     zip_path = build_package(demo_project, out_dir)
     manifest = load_manifest(zip_path)
@@ -373,8 +360,6 @@ def test_absurd_member_count_is_refused(demo_project: Path, out_dir: Path) -> No
     assert pkg.verify_archive(zip_path) == 1
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_implausible_declared_size_is_refused(demo_project: Path, out_dir: Path) -> None:
     """A declared expansion far beyond the archive size is a zip-bomb hint."""
     zip_path = build_package(demo_project, out_dir)
@@ -386,8 +371,6 @@ def test_implausible_declared_size_is_refused(demo_project: Path, out_dir: Path)
     assert pkg.verify_archive(zip_path) == 1
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_verification_streams_members(demo_project: Path, out_dir: Path, monkeypatch) -> None:
     """Report: hash members as streams, never whole-file reads."""
     zip_path = build_package(demo_project, out_dir)

@@ -1,13 +1,20 @@
 @echo off
-REM Outstanding v3.1.0 work, shown as XFAIL. These are marked
-REM xfail(strict=True), so this command SUCCEEDS while listing them.
-REM A failure here means something was fixed but still carries its marker.
+REM Outstanding work, shown as XFAIL. Tests are marked xfail(strict=True), so
+REM this command SUCCEEDS while listing them. As of v3.1.0 there are none,
+REM and pytest reports "no tests ran" (exit 5), which is the good outcome.
 python -m pytest -m defect -rx
-if errorlevel 1 (
+if errorlevel 6 goto :unexpected
+if errorlevel 5 (
     echo.
-    echo UNEXPECTED: a defect test passed, or the run failed. Check markers.
-) else (
-    echo.
-    echo OK - outstanding work listed above as XFAIL.
+    echo OK - no outstanding defect tests.
+    goto :done
 )
+if errorlevel 1 goto :unexpected
+echo.
+echo OK - outstanding work listed above as XFAIL.
+goto :done
+:unexpected
+echo.
+echo UNEXPECTED: a defect test passed, or the run failed. Check markers.
+:done
 pause

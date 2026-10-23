@@ -189,8 +189,6 @@ def test_manifest_disabled_archive_verifies_as_partial(demo_project: Path, out_d
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_missing_file_fails_the_manifest_instead_of_vanishing(
     demo_project: Path, out_dir: Path
 ) -> None:
@@ -200,8 +198,6 @@ def test_missing_file_fails_the_manifest_instead_of_vanishing(
         pkg.build_manifest(demo_project, included)
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_file_changed_during_packaging_fails_the_run(
     demo_project: Path, out_dir: Path, monkeypatch
 ) -> None:
@@ -230,8 +226,6 @@ def test_file_changed_during_packaging_fails_the_run(
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_failed_write_leaves_no_partial_archive(
     demo_project: Path, out_dir: Path, monkeypatch
 ) -> None:
@@ -252,8 +246,6 @@ def test_failed_write_leaves_no_partial_archive(
     assert list(out_dir.glob("*.sha256")) == []
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_failed_overwrite_preserves_the_existing_archive(
     demo_project: Path, out_dir: Path, monkeypatch
 ) -> None:
@@ -278,8 +270,6 @@ def test_failed_overwrite_preserves_the_existing_archive(
     assert existing.read_bytes() == b"a valid previous archive"
 
 
-@pytest.mark.defect
-@pytest.mark.xfail(strict=True, reason=DEFECT_REASON)
 def test_temporary_files_are_cleaned_up_after_failure(
     demo_project: Path, out_dir: Path, monkeypatch
 ) -> None:
@@ -425,22 +415,23 @@ def test_no_manifest_summary_reflects_sidecar_failure(
     assert "no verification evidence" in output
 
 
-def test_overwrite_is_refused_in_release_mode_until_atomic(
-    clean_project: Path, out_dir: Path
-) -> None:
-    """Replacement is not atomic yet, so --overwrite can destroy a good archive.
-
-    Refused in strict/release, where that matters most, until v3.1.0 lands
-    atomic replacement. Overridable with --force.
+def test_overwrite_in_release_replaces_atomically(clean_project: Path, out_dir: Path) -> None:
+    """v3.0.1 refused --overwrite in strict/release because replacement was not
+    atomic. v3.1.0 writes to a temporary file and swaps it in, so the refusal —
+    explicitly a stopgap "until v3.1.0" — is gone. The guarantee it stood in
+    for is tested directly by test_failed_overwrite_preserves_the_existing_archive.
     """
-    (out_dir / pkg.build_zip_name(clean_project, "rel")).write_bytes(b"previous release")
+    target = out_dir / pkg.build_zip_name(clean_project, "rel")
+    target.write_bytes(b"previous release")
 
     code = pkg.main(
         ["package", str(clean_project), "--profile", "release", "--output", str(out_dir),
          "--name", "rel", "--overwrite"]
     )
-    assert code != 0
-    assert (out_dir / pkg.build_zip_name(clean_project, "rel")).read_bytes() == b"previous release"
+    assert code == 0
+    assert target.read_bytes() != b"previous release"
+    assert pkg.verify_archive(target) == 0
+    assert sorted(p.name for p in out_dir.iterdir()) == [target.name, target.name + ".sha256"]
 
 
 def test_overwrite_in_release_is_permitted_with_force(clean_project: Path, out_dir: Path) -> None:

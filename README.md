@@ -38,17 +38,18 @@ Project Packager runs the release checklist for you, produces a clean archive, e
 
 Please read these before relying on the tool for anything important.
 
-- **Archive replacement is not atomic.** A failed write can leave a partial file,
-  and `--overwrite` can destroy a valid previous archive before its replacement
-  succeeds. For that reason `--overwrite` is refused in strict/release mode
-  unless you add `--force`. Atomic replacement is scheduled for v3.1.0.
-- **`--clean` is not fully hardened.** It removes only approved cache names and
-  will not follow a symlink, but it does not yet re-verify containment
-  immediately before each deletion. Release mode enables cleaning automatically.
-- **`verify` is not a hostile-archive verifier.** It does not yet reject
-  duplicate members, unsafe member paths, or malformed manifest structure, and
-  it reads members whole rather than streaming them. Treat it as a corruption
-  and accident detector, not a defence against a crafted archive.
+- **`verify` defends against hostile archives, but it is not a sandbox.** It
+  rejects duplicate and unsafe member names, malformed manifests, size
+  disagreements and implausible expansion, and streams every member. It never
+  extracts anything. It does not make an archive *trustworthy*, only
+  *consistent*: see the next section.
+- **Packaging reads every file twice.** Once to hash it for the manifest, and
+  once more from the temporary archive to prove the bytes written match. That is
+  what makes the manifest snapshot-consistent; on very large projects it costs
+  time.
+- **Atomicity is per file system.** The archive is written beside its final
+  name and swapped in with `os.replace`. A failure leaves the previous archive
+  untouched, but a power cut mid-swap is up to your file system.
 - **Secret scanning is heuristic and cannot prove a project is secret-free.**
   See the note at the end of the next section.
 
@@ -75,9 +76,9 @@ It does not show:
   Verification against a hash you fetched from the same place as the archive
   proves only that the two agree with each other.
 
-For origin and substitution resistance you need detached signatures — Minisign,
-GPG, or Sigstore. That may be offered as an optional feature later; it is not
-part of the ordinary workflow today.
+For origin and substitution resistance you need a detached signature. Project
+Packager supports [minisign](https://jedisct1.github.io/minisign/) as an
+optional extra — see [Signing](#signing--who-made-this-archive).
 
 ### `--no-scan` and unscanned files
 
@@ -129,6 +130,16 @@ Python 3.11+ (uses `tomllib`). No third-party packages.
 ## Installation
 
 It's one file. Copy `project_packager.py` anywhere on your path, or run it in place.
+
+Or install it as a command (still the same single file underneath):
+
+```bash
+pip install .                     # from a checkout
+project-packager --version
+project-packager package . --profile release
+```
+
+`pyproject.toml` reads the version from `TOOL_VERSION` in the script, so there is one place to bump it.
 
 ---
 
@@ -256,6 +267,8 @@ project                Project directory to package (default: .)
 --no-manifest          Skip embedding PACKAGE_MANIFEST.json
 --force                Package anyway despite secret findings or failed checks
 --overwrite            Allow overwriting an existing ZIP of the same name
+--sign                 Write a minisign signature (<zip>.minisig); checked up front
+--sign-key FILE        minisign secret key (default ~/.minisign/minisign.key)
 --open                 Open the output folder when done
 --list-included        Print every included file
 --list-excluded        Print every excluded item with its reason
@@ -353,7 +366,38 @@ python project_packager.py verify packaged\myproject_2026-07-03_1430.zip
 
 Verifies the ZIP against its `.sha256` sidecar, then re-hashes **every member** against the embedded manifest. Any modified file, any missing file, and any file added to the archive that isn't in the manifest is reported as a `FAIL`. Exit 0 = intact, 1 = problems.
 
+The archive is treated as untrusted input. Before anything is decompressed it is refused for: more than 200,000 members, duplicate member names, unsafe member names (absolute, drive-qualified, UNC, backslashed, or `..` traversal), a manifest over 64 MB, or members or a manifest declaring an expansion beyond 1000× the archive size (above 256 MB). A manifest of the wrong shape is reported as malformed, once, rather than as every member being "not in manifest". `file_count`, `total_bytes` and each per-file `size` must agree with what is actually there. Members are hashed as streams, never read whole, and nothing is extracted.
+
 The manifest can also be inspected or verified with standard tools — it's plain JSON, and the sidecar works with `sha256sum -c`.
+
+---
+
+## Signing — who made this archive?
+
+The sidecar hash and manifest prove an archive is *intact*. They can't prove who made it, because anyone who can replace the ZIP can replace those too. A signature can: only the holder of your secret key can produce one.
+
+Signing is optional and uses [minisign](https://jedisct1.github.io/minisign/), a small, well-regarded external tool. Nothing changes unless you ask for it.
+
+```bash
+# once: install minisign and make a key pair
+winget install jedisct1.minisign            # or: scoop install minisign / apt install minisign
+minisign -G                                  # ~/.minisign/minisign.key + minisign.pub
+
+# sign while packaging (prompts for your key password)
+python project_packager.py package . --profile release --sign
+
+# recipients verify with your PUBLIC key
+python project_packager.py verify app_2026-10-24_0900.zip --pubkey minisign.pub
+python project_packager.py verify app_2026-10-24_0900.zip --pubkey-string RWQ...
+```
+
+- `--sign` checks that minisign and the key exist **before** anything is written or cleaned.
+- The signature goes to `<zip>.minisig`, written atomically. Its trusted (signed) comment records the tool version, file name and SHA-256.
+- If signing fails after the archive is written, the archive stays (it's complete and verified) but the run exits 4 and says it is **not signed**.
+- `--overwrite` deletes the old archive's `.minisig`, which would otherwise describe different bytes.
+- `verify --pubkey` fails if the signature is missing, invalid, or made by another key. Without `--pubkey`, a present `.minisig` is reported as *present but not checked* rather than silently trusted.
+- Publish your **public** key somewhere recipients already trust (your GitHub profile, a README, a release page). A public key fetched from the same place as the archive proves only that the two agree.
+- The GUI doesn't sign: minisign needs to prompt for your key password in a terminal.
 
 ---
 
@@ -365,7 +409,7 @@ The manifest can also be inspected or verified with standard tools — it's plai
 | 1    | `check` failures or `verify` problems                          |
 | 2    | Project path missing or not a directory                        |
 | 3    | Output ZIP already exists (use `--overwrite`)                  |
-| 4    | OS error while writing                                         |
+| 4    | OS error, file changed mid-package, or signing failed          |
 | 5    | Secrets found in strict/release mode (`--force` to override)   |
 | 6    | Pre-package release checks failed (`--force` to override)      |
 | 7    | Archive verified only partially (valid sidecar, no manifest)   |
