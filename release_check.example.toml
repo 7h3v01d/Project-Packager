@@ -95,6 +95,13 @@ forbidden = [
 # Wheel build: actually builds the wheel (pip wheel . --no-deps) and checks
 # that critical modules and browser assets survive the packaging.
 # ---------------------------------------------------------------------------
+[limits]
+# Size gates for the release package. `check` reports them; release packaging
+# (or --check) refuses with exit 6 if they're exceeded. --force overrides.
+max_file_mb = 25
+max_total_mb = 200
+max_files = 5000
+
 [wheel]
 build = true
 timeout = 300

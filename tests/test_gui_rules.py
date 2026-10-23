@@ -22,6 +22,11 @@ sys.modules["pp"] = pp
 spec.loader.exec_module(pp)
 
 
+@pytest.fixture(autouse=True)
+def isolated_settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROJECT_PACKAGER_CONFIG_DIR", str(tmp_path / "_cfg"))
+
+
 def make(tmp_path: Path, files: dict[str, str]) -> Path:
     proj = tmp_path / "proj"
     for rel, body in files.items():

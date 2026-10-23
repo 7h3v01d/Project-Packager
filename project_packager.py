@@ -1168,6 +1168,9 @@ class SecretScanResult:
 
     findings: list[SecretFinding] = field(default_factory=list)
     unscanned: list[UnscannedFile] = field(default_factory=list)
+    # Matches on a line carrying ALLOW_SECRET_MARKER. Kept, never dropped, so
+    # every report can still show what was waved through and where.
+    allowed: list[SecretFinding] = field(default_factory=list)
 
     def __iter__(self):
         # Backwards compatible with callers that treat the result as a list.
@@ -1229,9 +1232,29 @@ def scan_for_secrets(project_dir: Path, files: list[Path]) -> SecretScanResult:
                 line = text.count("\n", 0, match.start()) + 1
                 token = match.group(0)
                 preview = token[:10] + "..." if len(token) > 10 else token
-                result.findings.append(SecretFinding(rel_path, line, label, preview))
+                finding = SecretFinding(rel_path, line, label, preview)
+                if line_allows_secret(text, match.start()):
+                    result.allowed.append(finding)
+                else:
+                    result.findings.append(finding)
 
     return result
+
+
+ALLOW_SECRET_MARKER = "packager: allow-secret"
+_ALLOW_SECRET_RE = re.compile(r"packager:\s*allow-secret\b")
+
+
+def line_allows_secret(text: str, offset: int) -> bool:
+    """True if the line containing `offset` carries the allow marker.
+
+    Same line only, by design: a marker cannot reach a token it is not
+    visibly sitting beside, so it cannot quietly bless a whole file.
+    """
+    start = text.rfind("\n", 0, offset) + 1
+    end = text.find("\n", offset)
+    line = text[start:] if end == -1 else text[start:end]
+    return bool(_ALLOW_SECRET_RE.search(line))
 
 
 # --------------------------------------------------------------------------
@@ -1607,6 +1630,7 @@ CONFIG_SCHEMA: dict[str, dict[str, str]] = {
     "banned": {"paths": "list[str]"},
     "requirements": {"file": "str", "forbidden": "list[str]"},
     "wheel": {"build": "bool", "timeout": "int", "must_contain": "list[str]"},
+    "limits": {"max_file_mb": "number", "max_total_mb": "number", "max_files": "int"},
 }
 
 
@@ -1615,6 +1639,9 @@ def _check_type(where: str, value: object, expected: str) -> None:
     if expected == "str":
         if not isinstance(value, str):
             raise ConfigError(f"{where} must be a string, got {type(value).__name__}")
+    elif expected == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError(f"{where} must be a positive number, got {value!r}")
     elif expected == "bool":
         if not isinstance(value, bool):
             raise ConfigError(f"{where} must be true or false, got {value!r}")
@@ -1724,6 +1751,37 @@ def load_check_config(project_dir: Path) -> dict | None:
     return config
 
 
+def evaluate_limits(
+    project_dir: Path, files: list[Path], limits: dict
+) -> list[tuple[str, bool, str]]:
+    """Check a package's file set against [limits]. Returns (label, ok, detail)."""
+    sizes: list[tuple[str, int]] = []
+    for file_path in files:
+        try:
+            size = file_path.stat().st_size
+        except OSError:
+            size = 0
+        sizes.append((normalise_rel(file_path.relative_to(project_dir)), size))
+    results: list[tuple[str, bool, str]] = []
+    mb = 1024 * 1024
+
+    if "max_files" in limits:
+        cap = limits["max_files"]
+        results.append((f"At most {cap} files", len(sizes) <= cap, f"{len(sizes)} files"))
+    if "max_total_mb" in limits:
+        cap = limits["max_total_mb"]
+        total = sum(size for _, size in sizes)
+        results.append((f"Total size at most {cap} MB", total <= cap * mb,
+                        f"{format_bytes(total)} uncompressed"))
+    if "max_file_mb" in limits:
+        cap = limits["max_file_mb"]
+        big = sorted(((rel, size) for rel, size in sizes if size > cap * mb),
+                     key=lambda item: item[1], reverse=True)
+        results.append((f"No single file over {cap} MB", not big,
+                        ", ".join(f"{rel} ({format_bytes(size)})" for rel, size in big[:5])))
+    return results
+
+
 def read_project_file(project_dir: Path, rel: str) -> str:
     """Read one or more '|'-joined project files, concatenated. Missing = ''."""
     parts = []
@@ -1777,6 +1835,16 @@ def run_builtin_checks(
                 f"{normalise_rel(f.rel_path)}:{f.line} [{f.label}]" for f in findings[:5]
             ),
         )
+
+        if secret_scan.allowed:
+            report.warn(
+                f"No secret matches allowed by '{ALLOW_SECRET_MARKER}'",
+                False,
+                "; ".join(
+                    f"{normalise_rel(f.rel_path)}:{f.line} [{f.label}]"
+                    for f in secret_scan.allowed[:5]
+                ),
+            )
 
         if secret_scan.unscanned:
             report.check(
@@ -1834,7 +1902,9 @@ def run_builtin_checks(
         report.check("ZIP is readable", False, str(exc))
 
 
-def run_config_checks(project_dir: Path, config: dict, report: CheckReport) -> None:
+def run_config_checks(
+    project_dir: Path, config: dict, report: CheckReport, *, include_limits: bool = True
+) -> None:
     """Per-project checks driven by release_check.toml."""
     files = walk_check_tree(project_dir)
 
@@ -1929,6 +1999,17 @@ def run_config_checks(project_dir: Path, config: dict, report: CheckReport) -> N
             f"move to extras: {heavy}",
         )
 
+    # -- Size limits (against what a release package would contain) ------------
+    limits = config.get("limits", {}) if include_limits else {}
+    if limits:
+        report.section("Package size limits (release profile)")
+        ignore_lines, _ = load_ignore_file(project_dir)
+        preview = preview_package(project_dir, profile="release",
+                                  ignore_lines=ignore_lines, scan_secrets=False)
+        for label, ok, detail in evaluate_limits(project_dir, preview.scan.included_files,
+                                                 limits):
+            report.check(label, ok, detail)
+
     # -- Wheel build --------------------------------------------------------------
     wheel_cfg = config.get("wheel", {})
     if wheel_cfg.get("build", False):
@@ -2012,6 +2093,13 @@ files = ["LICENSE", "README.md"]
 # [requirements]
 # file = "requirements.txt"
 # forbidden = ["heavy-optional-dep"]
+
+# [limits]
+# Size gates for the release package (checked by `check`, enforced by
+# `package --profile release` / --check). All optional.
+# max_file_mb = 25
+# max_total_mb = 200
+# max_files = 5000
 
 # [wheel]
 # build = true
@@ -2109,6 +2197,7 @@ def print_summary(
     ignore_count: int,
     findings: list[SecretFinding],
     unscanned: list[UnscannedFile] | None = None,
+    allowed: list[SecretFinding] | None = None,
     cleaned_dirs: int = 0,
     cleaned_files: int = 0,
     zip_uncompressed_bytes: int = 0,
@@ -2170,6 +2259,16 @@ def print_summary(
             )
         if len(findings) > 20:
             print(f"  ... plus {len(findings) - 20} more finding(s)")
+
+    if allowed:
+        print()
+        print(f"Secret matches ALLOWED by inline '{ALLOW_SECRET_MARKER}' "
+              f"({len(allowed)}) — these ship:")
+        for finding in allowed[:20]:
+            print(f"  ~ {normalise_rel(finding.rel_path)}:{finding.line}"
+                  f"  [{finding.label}]  {finding.preview}")
+        if len(allowed) > 20:
+            print(f"  ... plus {len(allowed) - 20} more")
 
     if unscanned:
         print()
@@ -2235,7 +2334,9 @@ def open_folder(path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def run_all_checks(project_dir: Path, *, include_secret_scan: bool = True) -> CheckReport:
+def run_all_checks(
+    project_dir: Path, *, include_secret_scan: bool = True, include_limits: bool = True
+) -> CheckReport:
     """Run the built-in checks, plus any configured in release_check.toml.
 
     `include_secret_scan` is disabled when packaging: the package stage scans
@@ -2257,7 +2358,7 @@ def run_all_checks(project_dir: Path, *, include_secret_scan: bool = True) -> Ch
 
     run_builtin_checks(project_dir, report, include_secret_scan=include_secret_scan)
     if config:
-        run_config_checks(project_dir, config, report)
+        run_config_checks(project_dir, config, report, include_limits=include_limits)
     else:
         print(f"\n(No {CHECK_CONFIG_NAME} — built-in checks only. "
               f"Run `init` to create one.)")
@@ -2305,6 +2406,288 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# Subcommand: why
+# --------------------------------------------------------------------------
+
+
+def classify_rule_origin(pattern: str) -> str:
+    """Where a matched exclusion pattern came from, for humans."""
+    if pattern in DEFAULT_EXCLUDE_DIR_NAMES | DEFAULT_EXCLUDE_DIR_PATTERNS | DEFAULT_EXCLUDE_FILE_PATTERNS:
+        if pattern in DEBRIS_FILE_PATTERNS:
+            return "built-in: session debris"
+        return "built-in default"
+    if pattern in STRICT_EXCLUDE_DIR_NAMES | STRICT_EXCLUDE_FILE_PATTERNS:
+        return "strict privacy set (--strict / release profile)"
+    return "your rule"
+
+
+def ignore_line_numbers(project_dir: Path, wanted: str) -> list[int]:
+    """1-based line numbers in .packagerignore whose pattern equals `wanted`."""
+    try:
+        text = (project_dir / IGNORE_FILE_NAME).read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return []
+    return [n for n, raw in enumerate(text.splitlines(), 1) if raw.strip() == wanted]
+
+
+def resolve_project_rel(project_dir: Path, raw: str) -> str | None:
+    """Turn a user-supplied path into a project-relative POSIX path, or None."""
+    candidate = Path(raw.replace("\\", "/")).expanduser()
+    options = [candidate] if candidate.is_absolute() else [project_dir / candidate,
+                                                           Path.cwd() / candidate]
+    for option in options:
+        # Lexical, deliberately not resolve(): a symlink must be explained as a
+        # symlink, not as whatever it happens to point at.
+        absolute = Path(os.path.abspath(option))
+        try:
+            rel = absolute.relative_to(project_dir)
+        except ValueError:
+            continue
+        if option.exists() or option.is_symlink():
+            return normalise_rel(rel)
+    return None
+
+
+def explain_path(project_dir: Path, rel: str, preview: PreviewResult) -> list[str]:
+    """Human explanation of one path's fate in `preview`. Read-only."""
+    project_dir = preview.project_dir
+    target = project_dir / rel
+    out: list[str] = []
+    user_lines, _ = load_ignore_file(project_dir) if (project_dir / IGNORE_FILE_NAME).exists() else ([], 0)
+
+    def cite(line: str) -> str:
+        nums = ignore_line_numbers(project_dir, line)
+        where = f"{IGNORE_FILE_NAME} line {', '.join(map(str, nums))}" if nums else "rule"
+        return f"{line}   ({where})"
+
+    for d in preview.scan.skipped_symlinks:
+        if normalise_rel(d.rel_path) == rel:
+            return [f"SKIPPED   {rel}", "  symlinks are never packaged — not even with a "
+                    "force-include. This cannot be overridden."]
+
+    if target.is_dir() and not target.is_symlink():
+        inc = [p for p in preview.scan.included_files if is_inside(p, target)]
+        own = [d for d in preview.scan.excluded if normalise_rel(d.rel_path) == rel]
+        if not own:
+            exc = [d for d in preview.scan.excluded
+                   if normalise_rel(d.rel_path).startswith(rel + "/")]
+            out.append(f"FOLDER    {rel}/")
+            out.append(f"  {len(inc)} file(s) included beneath it, {len(exc)} item(s) excluded.")
+            parent_hits = user_rules_excluding(rel, True, user_lines)
+            if parent_hits:
+                out.append("  The folder itself matches an exclusion but stays open because a "
+                           "force-include reaches inside:")
+                out += [f"    {cite(h)}" for h in parent_hits]
+            return out
+
+    if target in preview.scan.force_included or any(
+            p == target for p in preview.scan.force_included):
+        out.append(f"INCLUDED  {rel}   (force-included)")
+        name = rel.rsplit("/", 1)[-1]
+        for pattern in sorted(preview.rules.include_patterns):
+            if is_force_included(name, rel, Rules(include_patterns={pattern})):
+                bang = "!" + pattern
+                nums = ignore_line_numbers(project_dir, bang)
+                where = f"{IGNORE_FILE_NAME} line {', '.join(map(str, nums))}" if nums else "--include"
+                out.append(f"  by {bang if nums else pattern}   ({where})")
+        hidden = [d for d in user_rules_excluding(rel, False, user_lines)]
+        if hidden:
+            out.append("  It would otherwise be excluded by:")
+            out += [f"    {cite(h)}" for h in hidden]
+        return out
+
+    if any(p == target for p in preview.scan.included_files):
+        out.append(f"INCLUDED  {rel}")
+        out.append("  No exclusion rule matches it.")
+        return out
+
+    # Excluded: the path itself, or an ancestor folder that was pruned.
+    parts = rel.split("/")
+    decisions = {normalise_rel(d.rel_path): d for d in preview.scan.excluded}
+    for depth in range(len(parts), 0, -1):
+        here = "/".join(parts[:depth])
+        decision = decisions.get(here)
+        if decision is None:
+            continue
+        prefix = "" if depth == len(parts) else f"inside excluded folder {here}/ — "
+        out.append(f"EXCLUDED  {rel}")
+        reason = decision.reason
+        out.append(f"  {prefix}{reason}")
+        if ":" in reason:
+            pattern = reason.split(":", 1)[1].strip()
+            origin = classify_rule_origin(pattern)
+            mine = user_rules_excluding(here, depth != len(parts) or target.is_dir(), user_lines)
+            if mine:
+                out.append("  from your rule(s):")
+                out += [f"    {cite(m)}" for m in mine]
+                out.append("  Remove the rule, or force-include with:  "
+                           f"{suggest_patterns(rel, target.is_dir())['include_this']}")
+            else:
+                out.append(f"  source: {origin}")
+                if origin != "your rule":
+                    out.append("  Built-in rules can't be removed; override with this line "
+                               f"in {IGNORE_FILE_NAME}:  "
+                               f"{suggest_patterns(rel, target.is_dir())['include_this']}")
+        return out
+
+    return [f"UNKNOWN   {rel}", "  Not reached by the scan (unexpected — please report)."]
+
+
+def cmd_why(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project).expanduser().resolve()
+    if not project_dir.is_dir():
+        print(f"ERROR: not a directory: {project_dir}", file=sys.stderr)
+        return EXIT_BAD_PROJECT
+    try:
+        preview = preview_package(project_dir, profile=args.profile, strict=args.strict,
+                                  scan_secrets=False)
+    except ConfigError as exc:
+        print(f"ERROR: invalid {IGNORE_FILE_NAME}: {exc}", file=sys.stderr)
+        return EXIT_BAD_CONFIG
+    code = EXIT_OK
+    print(f"Profile: {args.profile}{' + strict' if preview.strict and args.profile != 'release' else ''}")
+    for raw in args.paths:
+        rel = resolve_project_rel(project_dir, raw)
+        print()
+        if rel is None or rel in ("", "."):
+            print(f"NOT FOUND {raw}  (no such path inside {project_dir})")
+            code = EXIT_PROBLEMS
+            continue
+        for line in explain_path(project_dir, rel, preview):
+            print(line)
+    print()
+    return code
+
+
+# --------------------------------------------------------------------------
+# Subcommand: diff
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Listing:
+    """What one side of a diff contains: rel path -> (size, sha256)."""
+
+    label: str
+    source: str            # "manifest", "hashed members", or "working tree"
+    files: dict[str, tuple[int, str]]
+    created: str = ""
+
+
+def listing_from_zip(zip_path: Path) -> Listing:
+    with zipfile.ZipFile(zip_path) as zf:
+        names = [n for n in zf.namelist() if not n.endswith("/")]
+        if MANIFEST_ARCNAME in names:
+            try:
+                manifest = json.loads(zf.read(MANIFEST_ARCNAME))
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise ValueError(f"{zip_path.name}: unreadable manifest: {exc}") from exc
+            files: dict[str, tuple[int, str]] = {}
+            for entry in manifest.get("files", []) if isinstance(manifest, dict) else []:
+                if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                    files[entry["path"]] = (int(entry.get("size") or 0), str(entry.get("sha256", "")))
+            return Listing(zip_path.name, "manifest", files, str(manifest.get("created_utc", "")))
+        files = {}
+        for name in names:
+            digest = hashlib.sha256()
+            with zf.open(name) as member:
+                for chunk in iter(lambda: member.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            files[name] = (zf.getinfo(name).file_size, digest.hexdigest())
+        return Listing(zip_path.name, "hashed members (no manifest)", files)
+
+
+def listing_from_dir(project_dir: Path, profile: str, strict: bool) -> Listing:
+    preview = preview_package(project_dir, profile=profile, strict=strict, scan_secrets=False)
+    files = {}
+    for path in preview.scan.included_files:
+        try:
+            files[normalise_rel(path.relative_to(preview.project_dir))] = (
+                path.stat().st_size, sha256_of_file(path))
+        except OSError:
+            continue
+    return Listing(f"{preview.project_dir.name}/", f"working tree, {profile} profile", files)
+
+
+def diff_listings(a: Listing, b: Listing) -> dict[str, list]:
+    added = sorted(set(b.files) - set(a.files))
+    removed = sorted(set(a.files) - set(b.files))
+    common = sorted(set(a.files) & set(b.files))
+    changed = [p for p in common if a.files[p][1] != b.files[p][1]]
+    return {"added": added, "removed": removed, "changed": changed,
+            "unchanged": [p for p in common if p not in set(changed)]}
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    listings = []
+    for raw in (args.old, args.new):
+        path = Path(raw).expanduser()
+        try:
+            if path.is_dir():
+                listings.append(listing_from_dir(path.resolve(), args.profile, args.strict))
+            elif path.is_file():
+                listings.append(listing_from_zip(path))
+            else:
+                print(f"ERROR: not found: {path}", file=sys.stderr)
+                return EXIT_BAD_PROJECT
+        except ConfigError as exc:
+            print(f"ERROR: invalid {IGNORE_FILE_NAME} in {path}: {exc}", file=sys.stderr)
+            return EXIT_BAD_CONFIG
+        except (OSError, zipfile.BadZipFile, ValueError) as exc:
+            print(f"ERROR: could not read {path}: {exc}", file=sys.stderr)
+            return EXIT_OS_ERROR
+    a, b = listings
+    result = diff_listings(a, b)
+    differs = bool(result["added"] or result["removed"] or result["changed"])
+
+    if args.json:
+        print(json.dumps({
+            "old": {"label": a.label, "source": a.source, "created": a.created,
+                    "file_count": len(a.files)},
+            "new": {"label": b.label, "source": b.source, "created": b.created,
+                    "file_count": len(b.files)},
+            "added": [{"path": p, "size": b.files[p][0]} for p in result["added"]],
+            "removed": [{"path": p, "size": a.files[p][0]} for p in result["removed"]],
+            "changed": [{"path": p, "old_size": a.files[p][0], "new_size": b.files[p][0]}
+                        for p in result["changed"]],
+            "unchanged_count": len(result["unchanged"]),
+        }, indent=2))
+        return EXIT_PROBLEMS if differs else EXIT_OK
+
+    def side(tag: str, lst: Listing) -> str:
+        when = f", created {lst.created}" if lst.created else ""
+        return f"  {tag}  {lst.label}  ({len(lst.files)} files, {lst.source}{when})"
+
+    print()
+    print("Comparing")
+    print(side("old", a))
+    print(side("new", b))
+    print()
+    for p in result["added"]:
+        print(f"  + {p}  ({format_bytes(b.files[p][0])})")
+    for p in result["removed"]:
+        print(f"  - {p}  ({format_bytes(a.files[p][0])})")
+    for p in result["changed"]:
+        old, new = a.files[p][0], b.files[p][0]
+        delta = new - old
+        sign = "+" if delta >= 0 else "-"
+        print(f"  ~ {p}  ({format_bytes(old)} -> {format_bytes(new)}, "
+              f"{sign}{format_bytes(abs(delta))})")
+    if differs:
+        print()
+    total_old = sum(v[0] for v in a.files.values())
+    total_new = sum(v[0] for v in b.files.values())
+    print(f"{len(result['added'])} added, {len(result['removed'])} removed, "
+          f"{len(result['changed'])} changed, {len(result['unchanged'])} unchanged.  "
+          f"Size {format_bytes(total_old)} -> {format_bytes(total_new)}.")
+    if "manifest" in (a.source, b.source):
+        print("Manifests are compared as recorded; run `verify` to confirm an archive "
+              "still matches its own.")
+    print()
+    return EXIT_PROBLEMS if differs else EXIT_OK
+
+
+# --------------------------------------------------------------------------
 # Subcommand: package
 # --------------------------------------------------------------------------
 
@@ -2335,7 +2718,10 @@ def cmd_package(args: argparse.Namespace) -> int:
 
     if run_checks_first:
         try:
-            report = run_all_checks(project_dir, include_secret_scan=False)
+            # Limits are gated below against the real file set of this run.
+            report = run_all_checks(
+                project_dir, include_secret_scan=False, include_limits=False
+            )
         except ConfigError as exc:
             report_config_error(exc)
             return EXIT_BAD_CONFIG
@@ -2437,6 +2823,7 @@ def cmd_package(args: argparse.Namespace) -> int:
             ignore_count=ignore_count,
             findings=findings,
             unscanned=secret_scan.unscanned,
+            allowed=secret_scan.allowed,
             cleaned_dirs=cleaned_dirs,
             cleaned_files=cleaned_files,
             manifest_embedded=not args.no_manifest,
@@ -2461,6 +2848,29 @@ def cmd_package(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return EXIT_SECRETS
+
+    # Size limits gate the release path only (release profile or --check),
+    # which is also the only path that has loaded and validated the config.
+    if run_checks_first:
+        try:
+            config = load_check_config(project_dir) or {}
+        except ConfigError as exc:
+            report_config_error(exc)
+            return EXIT_BAD_CONFIG
+        if config.get("limits"):
+            broken = [
+                (label, detail)
+                for label, ok, detail in evaluate_limits(
+                    project_dir, scan.included_files, config["limits"])
+                if not ok
+            ]
+            for label, detail in broken:
+                print(f"  FAIL  {label}: {detail}", file=sys.stderr)
+            if broken and not args.force:
+                print("ERROR: [limits] in release_check.toml exceeded — not packaging.\n"
+                      "Exclude something, raise the limit, or re-run with --force.",
+                      file=sys.stderr)
+                return EXIT_CHECKS_FAILED
 
     # Preflight the reserved-name collision here, where it is already known
     # from the scan, rather than discovering it inside create_zip() after
@@ -2533,6 +2943,7 @@ def cmd_package(args: argparse.Namespace) -> int:
         ignore_count=ignore_count,
         findings=findings,
         unscanned=secret_scan.unscanned,
+        allowed=secret_scan.allowed,
         cleaned_dirs=cleaned_dirs,
         cleaned_files=cleaned_files,
         zip_uncompressed_bytes=zip_uncompressed_bytes,
@@ -2599,6 +3010,8 @@ class PreviewResult:
     output_zip: Path
     strict: bool
     scanned_secrets: bool
+    rules: Rules = field(default_factory=Rules)
+    profile: str = "share"
 
 
 def preview_package(
@@ -2642,6 +3055,8 @@ def preview_package(
         output_zip=output_zip,
         strict=effective_strict,
         scanned_secrets=do_scan,
+        rules=rules,
+        profile=profile,
     )
 
 
@@ -2672,12 +3087,81 @@ GUI_STATUS = {
     "included": ("✓", "included", "text"),
     "forced": ("★", "force-included", "green"),
     "secret": ("⚠", "POSSIBLE SECRET", "red"),
+    "allowed": ("~", "secret (allowed)", "amber"),
     "unscanned": ("?", "not scannable", "amber"),
     "excluded": ("✕", "excluded", "dim"),
     "inherited": ("✕", "excluded (parent)", "dim"),
     "symlink": ("↪", "symlink (skipped)", "amber"),
     "folder": ("", "", "text"),
 }
+
+
+class GuiSettings:
+    """Per-user GUI memory: recent projects and per-project choices.
+
+    Stored in the user's config folder, never inside a project. A setting
+    that lived in the project would travel with a clone and silently change
+    how someone else's packaging behaves; this only remembers what *you*
+    picked last time. Convenience data only — it never affects the CLI.
+    """
+
+    KEYS = ("profile", "strict", "secrets", "name", "output", "overwrite",
+            "clean", "check", "open")
+    MAX_RECENT = 12
+
+    def __init__(self, path: Path | None = None):
+        self.path = path or self.default_path()
+        self.data: dict = {"version": 1, "recent": [], "projects": {}}
+        self.writable = True
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self.data["recent"] = [r for r in raw.get("recent", []) if isinstance(r, str)]
+                projects = raw.get("projects", {})
+                if isinstance(projects, dict):
+                    self.data["projects"] = {k: v for k, v in projects.items()
+                                             if isinstance(v, dict)}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            # Unreadable: leave it alone rather than overwrite what we can't parse.
+            self.writable = False
+
+    @staticmethod
+    def default_path() -> Path:
+        override = os.environ.get("PROJECT_PACKAGER_CONFIG_DIR")
+        if override:
+            base = Path(override)
+        elif sys.platform.startswith("win"):
+            base = Path(os.environ.get("APPDATA") or Path.home()) / "project_packager"
+        else:
+            base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "project_packager"
+        return base / "gui.json"
+
+    def recent(self) -> list[str]:
+        return list(self.data["recent"])
+
+    def for_project(self, project: Path) -> dict:
+        return dict(self.data["projects"].get(str(project), {}))
+
+    def remember(self, project: Path, values: dict) -> None:
+        key = str(project)
+        self.data["projects"][key] = {k: values[k] for k in self.KEYS if k in values}
+        recent = [r for r in self.data["recent"] if r != key]
+        self.data["recent"] = ([key] + recent)[: self.MAX_RECENT]
+
+    def save(self) -> bool:
+        if not self.writable:
+            return False
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix="gui.", suffix=".part", dir=str(self.path.parent))
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self.data, handle, indent=2)
+            os.replace(tmp, self.path)
+            return True
+        except OSError:
+            return False
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -2740,6 +3224,7 @@ class PackagerGUI:
         self.proc_queue: list[tuple[list[str], str]] = []
         self.last_zip: Path | None = None
         self.current_label = ""
+        self.settings = GuiSettings()
 
         if sys.platform.startswith("win"):
             try:  # crisp text on high-DPI displays
@@ -2879,9 +3364,13 @@ class PackagerGUI:
         ttk.Label(head, text=f"  v{TOOL_VERSION}", style="Dim.TLabel").pack(side="left")
         ttk.Button(head, text="Refresh  F5", command=self.refresh_now).pack(side="right")
         ttk.Button(head, text="Browse…", command=self.choose_project).pack(side="right", padx=6)
-        entry = ttk.Entry(head, textvariable=self.var_project)
-        entry.pack(side="right", fill="x", expand=True, padx=(24, 0))
-        entry.bind("<Return>", lambda e: self.load_project(Path(self.var_project.get())))
+        self.cmb_project = ttk.Combobox(head, textvariable=self.var_project,
+                                        values=self.settings.recent())
+        self.cmb_project.pack(side="right", fill="x", expand=True, padx=(24, 0))
+        self.cmb_project.bind("<Return>",
+                              lambda e: self.load_project(Path(self.var_project.get())))
+        self.cmb_project.bind("<<ComboboxSelected>>",
+                              lambda e: self.load_project(Path(self.var_project.get())))
 
         # Options row -----------------------------------------------------------
         opts = ttk.Frame(outer, padding=(0, 8, 0, 6))
@@ -2985,8 +3474,10 @@ class PackagerGUI:
         self.btn_check.pack(side="left")
         self.btn_verify = ttk.Button(btns, text="Verify…", command=self.run_verify)
         self.btn_verify.pack(side="left", padx=6)
+        self.btn_diff = ttk.Button(btns, text="Compare…", command=self.run_diff)
+        self.btn_diff.pack(side="left")
         self.btn_init = ttk.Button(btns, text="Init release_check.toml", command=self.run_init)
-        self.btn_init.pack(side="left")
+        self.btn_init.pack(side="left", padx=6)
         self.btn_stop = ttk.Button(btns, text="Stop", style="Danger.TButton",
                                    command=self.stop_process, state="disabled")
         self.btn_stop.pack(side="left", padx=6)
@@ -3129,7 +3620,11 @@ class PackagerGUI:
             self._message("error", "Not a folder", f"{project_dir} is not a directory.")
             self.var_project.set(str(self.project_dir))
             return
+        if getattr(self, "_loaded_once", False) and project_dir != self.project_dir:
+            self._remember()
+        self._loaded_once = True
         self.project_dir = project_dir
+        self._apply_settings(self.settings.for_project(project_dir))
         self.var_project.set(str(project_dir))
         self.root.title(f"Project Packager — {project_dir.name}")
         self.undo_stack.clear()
@@ -3144,6 +3639,7 @@ class PackagerGUI:
                 "refuse (exit 9) until it is repaired or removed."
             )
         self.saved_lines = list(self.ignore.lines) if self.ignore else []
+        self._remember()
         self._sync_rule_lists()
         self._on_profile()
         self._update_output_hint()
@@ -3341,6 +3837,10 @@ class PackagerGUI:
         for f in res.secrets.findings:
             secrets.setdefault(normalise_rel(f.rel_path), []).append(f"{f.label} (line {f.line})")
         unscanned = {normalise_rel(u.path): u.reason for u in res.secrets.unscanned_text_files()}
+        allowed: dict[str, list[str]] = {}
+        for f in res.secrets.allowed:
+            allowed.setdefault(normalise_rel(f.rel_path), []).append(
+                f"{f.label} (line {f.line}, allowed by marker)")
         lines = self._lines()
 
         for path in res.scan.included_files:
@@ -3357,6 +3857,8 @@ class PackagerGUI:
                 status, why = "secret", "; ".join(secrets[rel])
             elif rel in unscanned:
                 status, why = "unscanned", unscanned[rel]
+            elif rel in allowed:
+                status, why = "allowed", "; ".join(allowed[rel])
             records[rel] = dict(kind="file", status=status, why=why, size=size)
 
         for d in res.scan.excluded:
@@ -3378,11 +3880,11 @@ class PackagerGUI:
             return False
         status = rec["status"]
         if flt == "Included":
-            return status in ("included", "forced", "secret", "unscanned")
+            return status in ("included", "forced", "secret", "unscanned", "allowed")
         if flt == "Excluded":
             return status in ("excluded", "inherited", "symlink")
         if flt == "Attention":
-            return status in ("secret", "unscanned", "symlink", "forced")
+            return status in ("secret", "unscanned", "symlink", "forced", "allowed")
         return True
 
     def repaint(self) -> None:
@@ -3403,12 +3905,12 @@ class PackagerGUI:
                 if folder in visible:
                     continue
                 agg = folders.setdefault(folder, dict(inc=0, exc=0, size=0, warn=0))
-                if rec["status"] in ("included", "forced", "secret", "unscanned"):
+                if rec["status"] in ("included", "forced", "secret", "unscanned", "allowed"):
                     agg["inc"] += 1
                     agg["size"] += rec.get("size") or 0
                 else:
                     agg["exc"] += 1
-                if rec["status"] in ("secret", "unscanned", "symlink"):
+                if rec["status"] in ("secret", "unscanned", "symlink", "allowed"):
                     agg["warn"] += 1
 
         children: dict[str, list[tuple[bool, str]]] = {}
@@ -3507,13 +4009,15 @@ class PackagerGUI:
             return
         inc = len(res.scan.included_files)
         size = sum((r.get("size") or 0) for r in self.records.values()
-                   if r["status"] in ("included", "forced", "secret", "unscanned"))
+                   if r["status"] in ("included", "forced", "secret", "unscanned", "allowed"))
         bits = [f"{inc} files in  ·  {format_bytes(size)}",
                 f"{len(res.scan.excluded)} excluded"]
         if res.scan.force_included:
             bits.append(f"{len(res.scan.force_included)} forced")
         if res.secrets.findings:
             bits.append(f"⚠ {len(res.secrets.findings)} possible secret(s)")
+        if res.secrets.allowed:
+            bits.append(f"{len(res.secrets.allowed)} allowed by marker")
         if res.secrets.unscanned_text_files():
             bits.append(f"{len(res.secrets.unscanned_text_files())} unscannable")
         if res.scan.skipped_symlinks:
@@ -3575,7 +4079,7 @@ class PackagerGUI:
         if status == "symlink":
             self._set_status("Symlinks are never packaged — this cannot be overridden.")
             return
-        if status in ("included", "secret", "unscanned", "folder"):
+        if status in ("included", "secret", "unscanned", "allowed", "folder"):
             self.add_rule(sugg["exclude_this"])
         elif status == "forced":
             own = [inc for inc in user_includes_matching(rel, lines)]
@@ -3662,6 +4166,7 @@ class PackagerGUI:
                 menu.add_command(label=f"Remove force-include   !{inc}", state=editable,
                                  command=lambda l="!" + inc: self._remove_line(l))
         menu.add_separator()
+        menu.add_command(label="Why?  (explain in log)", command=lambda: self.run_why(rel))
         menu.add_command(label="Copy relative path", command=lambda: self._copy(rel))
         menu.add_command(label="Show in file manager",
                          command=lambda: open_folder(self.project_dir / (rel if is_dir else
@@ -3720,6 +4225,36 @@ class PackagerGUI:
 
     def run_checks(self) -> None:
         self._start([(self._cli("check", str(self.project_dir)), "check")])
+
+    def _profile_args(self) -> list[str]:
+        args = ["--profile", self.var_profile.get()]
+        if self.var_strict.get() and self.var_profile.get() != "release":
+            args.append("--strict")
+        return args
+
+    def _note_unsaved(self) -> None:
+        if self.is_dirty():
+            self._log(f"(note: uses the saved {IGNORE_FILE_NAME}; you have unsaved edits)\n",
+                      "warn")
+
+    def run_why(self, rel: str) -> None:
+        self._note_unsaved()
+        self._start([(self._cli("why", rel, "--project", str(self.project_dir),
+                                *self._profile_args()), "why")])
+
+    def run_diff(self) -> None:
+        from tkinter import filedialog
+        out = self.var_output.get().strip()
+        start = Path(out).expanduser() if out else self.project_dir.parent / "packaged"
+        chosen = filedialog.askopenfilename(
+            parent=self.root, title="Compare an earlier package with the project as it is now",
+            initialdir=str(start if start.is_dir() else self.project_dir),
+            filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")])
+        if not chosen:
+            return
+        self._note_unsaved()
+        self._start([(self._cli("diff", chosen, str(self.project_dir),
+                                *self._profile_args()), "diff")])
 
     def run_init(self) -> None:
         self._start([(self._cli("init", str(self.project_dir)), "init")])
@@ -3785,6 +4320,11 @@ class PackagerGUI:
         self.proc = None
         self._set_running(False)
         meaning = EXIT_MEANINGS.get(code, "stopped" if code < 0 else "unknown exit code")
+        if label == "diff" and code in (0, 1):
+            meaning = "identical" if code == 0 else "differences listed above"
+            code_tag = "ok"
+            self._log(f"── exit {code}: {meaning}\n", code_tag)
+            return
         self._log(f"── exit {code}: {meaning}\n", "ok" if code == 0 else "fail")
         if label == "package" and code == 0 and self.last_zip and self.last_zip.is_file():
             self._log("Verifying the new archive…\n", "dim")
@@ -3798,7 +4338,7 @@ class PackagerGUI:
     def _set_running(self, running: bool) -> None:
         state = "disabled" if running else "normal"
         for btn in (self.btn_package, self.btn_dry, self.btn_check, self.btn_verify,
-                    self.btn_init):
+                    self.btn_init, self.btn_diff):
             btn.configure(state=state)
         self.btn_stop.configure(state="normal" if running else "disabled")
 
@@ -3846,9 +4386,34 @@ class PackagerGUI:
         getattr(messagebox, "showerror" if kind == "error" else "showinfo")(
             title, text, parent=self.root)
 
+    def _setting_vars(self) -> dict:
+        return {"profile": self.var_profile, "strict": self.var_strict,
+                "secrets": self.var_secrets, "name": self.var_name,
+                "output": self.var_output, "overwrite": self.var_overwrite,
+                "clean": self.var_clean, "check": self.var_check, "open": self.var_open}
+
+    def _apply_settings(self, stored: dict) -> None:
+        defaults = {"profile": "share", "strict": False, "secrets": True, "name": "",
+                    "output": "", "overwrite": False, "clean": False, "check": False,
+                    "open": False}
+        for key, var in self._setting_vars().items():
+            value = stored.get(key, defaults[key])
+            if key == "profile" and value not in ("share", "release", "backup"):
+                value = "share"
+            if type(value) is not type(defaults[key]):
+                value = defaults[key]
+            var.set(value)
+
+    def _remember(self) -> None:
+        values = {k: v.get() for k, v in self._setting_vars().items()}
+        self.settings.remember(self.project_dir, values)
+        self.settings.save()
+        self.cmb_project.configure(values=self.settings.recent())
+
     def on_close(self) -> None:
         if not self._confirm_discard():
             return
+        self._remember()
         if self.proc is not None:
             self.stop_process()
         self.root.destroy()
@@ -3858,7 +4423,7 @@ class PackagerGUI:
 # CLI
 # --------------------------------------------------------------------------
 
-KNOWN_COMMANDS = {"package", "check", "verify", "init", "gui"}
+KNOWN_COMMANDS = {"package", "check", "verify", "init", "gui", "why", "diff"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3939,6 +4504,33 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("project", nargs="?", default=".",
                    help="Project directory to initialise.")
     i.set_defaults(func=cmd_init)
+
+    # -- why ---------------------------------------------------------------
+    w = sub.add_parser(
+        "why",
+        help="Explain why a path is included or excluded, and by which rule.",
+    )
+    w.add_argument("paths", nargs="+", metavar="PATH",
+                   help="File or folder (relative to the project, or absolute).")
+    w.add_argument("--project", "-p", default=".", help="Project directory.")
+    w.add_argument("--profile", choices=("share", "release", "backup"), default="share")
+    w.add_argument("--strict", action="store_true", help="Apply the strict privacy set.")
+    w.set_defaults(func=cmd_why)
+
+    # -- diff ---------------------------------------------------------------
+    d = sub.add_parser(
+        "diff",
+        help="Compare two packages, or a package and a project folder. "
+             "Exit 0 identical, 1 different.",
+    )
+    d.add_argument("old", help="Older ZIP (or project folder).")
+    d.add_argument("new", help="Newer ZIP or project folder (e.g. '.').")
+    d.add_argument("--profile", choices=("share", "release", "backup"), default="share",
+                   help="Profile used when a side is a project folder.")
+    d.add_argument("--strict", action="store_true",
+                   help="Apply the strict privacy set when a side is a folder.")
+    d.add_argument("--json", action="store_true", help="Machine-readable output.")
+    d.set_defaults(func=cmd_diff)
 
     # -- gui --------------------------------------------------------------
     g = sub.add_parser(

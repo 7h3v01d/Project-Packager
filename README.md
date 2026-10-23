@@ -29,6 +29,8 @@ Project Packager runs the release checklist for you, produces a clean archive, e
 | `package` | Clean ZIP with embedded SHA-256 manifest + `.sha256` sidecar             |
 | `verify`  | Re-hash every archive member against the manifest; detect corruption     |
 | `gui`     | Visual include/exclude editor and runner (also `--gui`)                  |
+| `why`     | Explain why a path is in or out, citing the exact rule and line          |
+| `diff`    | Compare two packages, or a package against the project as it is now      |
 
 **Backward compatible:** `python project_packager.py .` (no subcommand) still packages.
 
@@ -95,6 +97,14 @@ classified by content, not size:
 Supported text encodings are UTF-8, UTF-8 with BOM, UTF-16LE/BE (with or
 without a BOM), and UTF-32. Classification follows content, never the filename:
 a printable file named `report.pdf` is scanned, and a real PNG is not.
+
+**False positives** — test fixtures, documentation examples — can be allowed with an inline marker on the *same line* as the match:
+
+```python
+EXAMPLE_KEY = "AKIA................"  # packager: allow-secret
+```
+
+Allowed matches never block, but they are never hidden either: `package` lists them under *ALLOWED by inline marker* in every summary, `check` reports them as a warning, and the GUI shows them in amber. A marker on a line of its own covers nothing.
 
 Likewise, the secret scanner is heuristic. It detects known token shapes in
 files it can read, reports files it could not scan, and blocks release mode on
@@ -182,6 +192,14 @@ forbidden = ["faster-whisper", "pytesseract"]
 build = true
 timeout = 300
 must_contain = ["app.py", "static/app.css", "static/js/core.js"]
+
+[limits]
+# Size gates on what a release package would contain. `check` reports them
+# against the release-profile file set; `package --profile release` (or
+# --check) refuses with exit 6 if the real file set exceeds them.
+max_file_mb = 25
+max_total_mb = 200
+max_files = 5000
 ```
 
 The checker prints `OK` / `FAIL` / `WARN` per item and exits 1 if anything failed — ready for batch files and CI.
@@ -281,13 +299,49 @@ Uses `tkinter` from the standard library, so the tool stays dependency-free. (On
 - **Right-click** for: exclude this, exclude every `*.ext`, exclude every folder with this name, force-include, remove the rule(s) that excluded this, copy path, show in file manager. Excluded folders can be expanded to rescue a single file from inside them.
 - **Rule lists** for exclusions and force-includes; select a rule to highlight what it matches. Undo (Ctrl+Z), Revert, Save (Ctrl+S).
 - **Filter** by All / Included / Excluded / Attention, and find by name.
-- **Package, Dry run, Run checks, Verify, Init** run this same script as a subprocess, so gates and exit codes are identical to the CLI. A successful package is verified automatically.
+- **Package, Dry run, Run checks, Verify, Compare, Init** run this same script as a subprocess, so gates and exit codes are identical to the CLI. A successful package is verified automatically. **Compare…** diffs an earlier ZIP against the project as it is now; **Why?** on the right-click menu prints the `why` explanation into the log.
+- **Remembers** your profile, name, output folder and checkboxes per project, plus a recent-projects list. That lives in your user config (`%APPDATA%\project_packager\gui.json` on Windows, `~/.config/project_packager/gui.json` elsewhere), never in the project, so a cloned repo can't change how your packaging behaves. The CLI never reads it.
 
 Safety properties:
 
 - The preview is computed by the same `build_rules` / `scan_project` / `scan_for_secrets` path as `package`. The GUI has no matching logic of its own.
 - Nothing is written until Save. Saving is atomic (temp file + replace) and keeps your comments and line order.
 - If `.packagerignore` exists but can't be read, editing is disabled — saving a blank list over it would silently drop exclusions you meant to keep.
+
+---
+
+## `why` — which rule decided this?
+
+```bash
+python project_packager.py why data/raw/big.csv .venv/lib/x.py .env --profile release
+```
+
+```
+EXCLUDED  data/raw/big.csv
+  path pattern: data/raw
+  from your rule(s):
+    data/raw/   (.packagerignore line 3)
+  Remove the rule, or force-include with:  !/data/raw/big.csv
+
+EXCLUDED  .env
+  file pattern: .env
+  source: strict privacy set (--strict / release profile)
+```
+
+Reports included / force-included / excluded / skipped symlink, the matching rule, whether it is built-in, strict, or yours (with its line number), and the exact line that would override it. Uses the same scan as `package`. Exit 0, or 1 if a path doesn't exist. Options: `--project/-p`, `--profile`, `--strict`.
+
+---
+
+## `diff` — what changed between releases?
+
+```bash
+python project_packager.py diff packaged\app_2026-09-01_1200.zip packaged\app_2026-10-24_0900.zip
+python project_packager.py diff packaged\app_2026-09-01_1200.zip .     # vs. what you'd ship now
+```
+
+Lists added (`+`), removed (`-`) and changed (`~`, with size delta) files. A ZIP side uses its embedded manifest (or hashes members if it has none); a folder side uses exactly what `package` would include under `--profile` / `--strict` — so excluded junk never shows up as a change, but a file that newly *would* ship does. `--json` for scripts. Exit 0 identical, 1 different, 2 path missing, 4 unreadable archive, 9 bad `.packagerignore`.
+
+`diff` compares manifests as recorded; it does not re-hash archive members. Run `verify` to confirm an archive still matches its own manifest.
 
 ---
 

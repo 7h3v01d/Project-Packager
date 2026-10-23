@@ -17,6 +17,24 @@ All notable changes to Project Packager are recorded here.
   `\!` escapes a literal `!`. Old builds read a `!` line as a literal
   exclusion that matches nothing they would otherwise have shipped, so a file
   written for this version fails safe on an older one.
+- **`why PATH...`** explains each path's fate: included, force-included,
+  excluded or skipped symlink; the rule responsible; whether it is built-in,
+  from the strict set, or yours (with its `.packagerignore` line number); and
+  the exact line that would override it.
+- **`diff OLD NEW`** compares two packages, or a package with a project
+  folder (using the same rules `package` would). Added / removed / changed with
+  size deltas, `--json`, exit 0 identical / 1 different.
+- **`[limits]` in `release_check.toml`** — `max_file_mb`, `max_total_mb`,
+  `max_files`. `check` reports them against the release file set; release
+  packaging (or `--check`) refuses with exit 6 against the real file set,
+  before anything is cleaned. `--force` overrides. Share packaging ignores them.
+- **Inline `packager: allow-secret` marker** for known false positives. Same
+  line only. Allowed matches don't block but are listed in every package
+  summary, warned about by `check`, and shown amber in the GUI.
+- **GUI:** Compare… (diff an earlier ZIP against the project now), Why? on
+  the context menu, allowed-secret status, and per-user memory of profile,
+  name, output and options per project plus a recent-projects list. Stored in
+  the user config folder, never in the project; the CLI never reads it.
 - `preview_package()`, `IgnoreFile`, `user_rules_excluding()`,
   `user_includes_matching()` and `suggest_patterns()` — the read-only engine
   pieces the GUI is built on, usable from tests and scripts.

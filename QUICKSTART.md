@@ -243,6 +243,12 @@ python project_packager.py check .
 # Pick includes/excludes visually
 python project_packager.py --gui
 
+# Why is this file in (or out)?
+python project_packager.py why path/to/file
+
+# What changed since the last release?
+python project_packager.py diff ..\packaged\myproj_2026-09-01_1200.zip .
+
 # Rescue something the defaults dropped
 python project_packager.py package . --include "docs/diagrams/*.png"
 ```

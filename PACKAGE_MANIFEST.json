@@ -1,10 +1,10 @@
 {
   "tool": "project_packager",
   "version": "3.0.1",
-  "created_utc": "2026-10-23T14:09:43+00:00",
+  "created_utc": "2026-10-23T14:40:06+00:00",
   "project": "src",
-  "file_count": 18,
-  "total_bytes": 246749,
+  "file_count": 19,
+  "total_bytes": 289948,
   "files": [
     {
       "path": ".github/workflows/tests.yml",
@@ -18,8 +18,8 @@
     },
     {
       "path": "CHANGELOG.md",
-      "size": 15238,
-      "sha256": "6765948636f4ba3f538f1c8793035b9ddf37d76cfab70b3c8256ebd6e437db1c"
+      "size": 16537,
+      "sha256": "70fc59058d93192a5bebdfcca1833fb7def114c5e3f5768f70580707f8c55fe6"
     },
     {
       "path": "LICENSE",
@@ -28,13 +28,13 @@
     },
     {
       "path": "QUICKSTART.md",
-      "size": 7919,
-      "sha256": "0d54e3a8b9938759af60744c2dfc358f4f65901d9c7b9c4c38a3ac2b86476636"
+      "size": 8109,
+      "sha256": "f57351efa96552568afd62b02b2aea5e550c977a89e9921f9f82b7568c08a37e"
     },
     {
       "path": "README.md",
-      "size": 16064,
-      "sha256": "fcf22b49829ac27404f507da16d227b18e9ae546de313ac886f860f86f793917"
+      "size": 19063,
+      "sha256": "ce2c855cb05f20139032bfb7d253c8380b9f330f8e5d9e37fdaf060d23d28f78"
     },
     {
       "path": "build.bat",
@@ -58,8 +58,8 @@
     },
     {
       "path": "project_packager.py",
-      "size": 161390,
-      "sha256": "fd05dcc186f2d821c60d54bef274335ee8c836bf90e0f3e3dd4379d073cdeaed"
+      "size": 188283,
+      "sha256": "be6969ec8eafdb7cea03011d491c55d6a84c66697ba318684445fb11c9b4f8cf"
     },
     {
       "path": "pytest.ini",
@@ -68,8 +68,8 @@
     },
     {
       "path": "release_check.example.toml",
-      "size": 4088,
-      "sha256": "23510451700c26441ca73fb6aada7abd4b556663979d6469dcd8b5b5f74a0111"
+      "size": 4304,
+      "sha256": "c0b7142fc4c5ef86b90ada6f2a104865b20f5d38a4759bd0a2bceb159d5ee33e"
     },
     {
       "path": "requirements-dev.txt",
@@ -93,8 +93,13 @@
     },
     {
       "path": "tests/test_gui_rules.py",
-      "size": 11843,
-      "sha256": "4c2056509201ebe5b26d0e83b9db29a5a764d3840ecdbb856112527e28484484"
+      "size": 11999,
+      "sha256": "48426c58443565b18d98a0e98a25045342657cbf9c7df5cf959ca3fc2b412314"
+    },
+    {
+      "path": "tests/test_why_diff_limits.py",
+      "size": 11446,
+      "sha256": "7dac63359d80e4eeaccf8fcbd0e59fcaefa8710153a62d3300764995a8ca4ce0"
     }
   ]
 }
