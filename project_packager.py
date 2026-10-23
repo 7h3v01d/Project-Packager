@@ -343,13 +343,28 @@ def normalise_pattern(pattern: str) -> str:
     return pattern.replace("\\", "/").strip()
 
 
+def split_include_pattern(pattern: str) -> tuple[bool, str]:
+    """Return (is_path_pattern, pattern_to_match) for a force-include pattern.
+
+    A leading slash anchors to the project root, as it does for exclusions.
+    Previously "/notes.txt" was kept verbatim and matched against relative
+    paths, which never start with "/", so the include silently did nothing.
+    """
+    if pattern.startswith("/"):
+        return True, pattern.lstrip("/")
+    return "/" in pattern, pattern
+
+
 def is_force_included(file_name: str, rel_posix: str, rules: Rules) -> str | None:
     """Return the matching --include pattern, or None."""
     for pattern in rules.include_patterns:
-        if "/" in pattern:
-            if matches_path_pattern(rel_posix, [pattern]):
+        is_path, clean = split_include_pattern(pattern)
+        if not clean:
+            continue
+        if is_path:
+            if matches_path_pattern(rel_posix, [clean]):
                 return pattern
-        elif fnmatch.fnmatch(file_name, pattern):
+        elif fnmatch.fnmatch(file_name, clean):
             return pattern
     return None
 
@@ -364,9 +379,12 @@ def include_may_reopen_dir(rel_posix: str, rules: Rules) -> str | None:
     """
     prefix = rel_posix.rstrip("/") + "/"
     for pattern in rules.include_patterns:
-        if "/" not in pattern:
+        is_path, clean = split_include_pattern(pattern)
+        if not is_path:
             continue
-        clean = pattern.rstrip("/")
+        clean = clean.rstrip("/")
+        if not clean:
+            continue
         if clean.startswith(prefix) or fnmatch.fnmatch(prefix.rstrip("/"), clean):
             return pattern
         # A wildcard segment ("docs/*/notes.md") can still target this branch.
@@ -480,37 +498,209 @@ def build_rules(
         for pattern in STRICT_EXCLUDE_FILE_PATTERNS:
             (rules.path_patterns if "/" in pattern else rules.file_patterns).add(pattern)
 
-    for raw_pattern in ignore_patterns + list(extra_excludes):
-        pattern = normalise_pattern(raw_pattern)
-        if not pattern:
-            continue
+    # .packagerignore lines starting with "!" are force-includes, exactly as if
+    # given with --include. "\!" escapes a literal leading "!". The CLI's own
+    # --exclude values are never reinterpreted: "!" there stays literal.
+    file_excludes, file_includes = split_ignore_lines(ignore_patterns)
 
-        # A leading slash anchors the pattern to the project root, as in
-        # gitignore. Without this, "/docs/" became the path pattern "/docs",
-        # which can never match a relative path — the rule was silently
-        # discarded and the user got no exclusion and no warning.
-        anchored = pattern.startswith("/")
-        if anchored:
-            pattern = pattern.lstrip("/")
-            if not pattern:
-                continue
+    for raw_pattern in file_excludes + list(extra_excludes):
+        add_exclude_pattern(rules, raw_pattern)
 
-        if pattern.endswith("/"):
-            clean = pattern.rstrip("/")
-            if anchored or "/" in clean:
-                rules.path_patterns.add(clean)
-            else:
-                rules.dir_patterns.add(clean)
-        elif anchored or "/" in pattern:
-            rules.path_patterns.add(pattern)
-        else:
-            rules.file_patterns.add(pattern)
-            rules.dir_patterns.add(pattern)
-
-    rules.include_patterns |= {
-        normalise_pattern(p) for p in include_patterns if normalise_pattern(p)
-    }
+    for raw_include in list(include_patterns) + file_includes:
+        pattern = normalise_pattern(raw_include)
+        if pattern and pattern.strip("/"):
+            rules.include_patterns.add(pattern)
     return rules
+
+
+def split_ignore_lines(lines: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Split .packagerignore pattern lines into (excludes, force-includes)."""
+    excludes: list[str] = []
+    includes: list[str] = []
+    for line in lines:
+        if line.startswith("\\!"):
+            excludes.append(line[1:])
+        elif line.startswith("!"):
+            if line[1:].strip():
+                includes.append(line[1:].strip())
+        else:
+            excludes.append(line)
+    return excludes, includes
+
+
+def add_exclude_pattern(rules: Rules, raw_pattern: str) -> None:
+    """Add one user exclusion (.packagerignore line or --exclude) to rules."""
+    pattern = normalise_pattern(raw_pattern)
+    if not pattern:
+        return
+
+    # A leading slash anchors the pattern to the project root, as in
+    # gitignore. Without this, "/docs/" became the path pattern "/docs",
+    # which can never match a relative path — the rule was silently
+    # discarded and the user got no exclusion and no warning.
+    anchored = pattern.startswith("/")
+    if anchored:
+        pattern = pattern.lstrip("/")
+        if not pattern:
+            return
+
+    if pattern.endswith("/"):
+        clean = pattern.rstrip("/")
+        if anchored or "/" in clean:
+            rules.path_patterns.add(clean)
+        else:
+            rules.dir_patterns.add(clean)
+    elif anchored or "/" in pattern:
+        rules.path_patterns.add(pattern)
+    else:
+        rules.file_patterns.add(pattern)
+        rules.dir_patterns.add(pattern)
+
+
+def user_rules_excluding(rel_posix: str, is_dir: bool, lines: Iterable[str]) -> list[str]:
+    """Which user exclusion lines exclude this path, directly or via a parent.
+
+    Used by the GUI to answer "why is this excluded, and what do I remove to
+    bring it back?". Built-in and strict rules are deliberately not reported:
+    those cannot be removed, only overridden with a force-include.
+    """
+    parts = rel_posix.strip("/").split("/")
+    hits: list[str] = []
+    excludes, _ = split_ignore_lines(lines)
+    for line in excludes:
+        single = Rules()
+        add_exclude_pattern(single, line)
+        for depth in range(len(parts), 0, -1):
+            sub = "/".join(parts[:depth])
+            name = parts[depth - 1]
+            if depth == len(parts) and not is_dir:
+                matched = should_exclude_file(name, sub, single)
+            else:
+                matched = should_exclude_dir(name, sub, single)
+            if matched:
+                hits.append(line)
+                break
+    return hits
+
+
+def user_includes_matching(rel_posix: str, lines: Iterable[str]) -> list[str]:
+    """Which "!" lines force-include this path (as written, without the "!")."""
+    _, includes = split_ignore_lines(lines)
+    name = rel_posix.rsplit("/", 1)[-1]
+    hits = []
+    for include in includes:
+        single = Rules(include_patterns={normalise_pattern(include)})
+        if is_force_included(name, rel_posix, single):
+            hits.append(include)
+    return hits
+
+
+class IgnoreFile:
+    """Editable view of .packagerignore that preserves comments and order.
+
+    The GUI edits rules through this rather than rewriting the file wholesale,
+    so hand-written comments survive. Loading uses the same strict rules as
+    packaging: a file that cannot be read raises ConfigError, and the caller
+    must refuse to save over it — overwriting an unreadable safety file with
+    a blank one would silently discard every exclusion it held.
+    """
+
+    def __init__(self, project_dir: Path, lines: list[str], existed: bool):
+        self.project_dir = project_dir
+        self.lines = lines
+        self.existed = existed
+
+    @property
+    def path(self) -> Path:
+        return self.project_dir / IGNORE_FILE_NAME
+
+    @classmethod
+    def load(cls, project_dir: Path) -> "IgnoreFile":
+        path = project_dir / IGNORE_FILE_NAME
+        if not path.exists():
+            return cls(project_dir, [], existed=False)
+        load_ignore_file(project_dir)  # strict validation; raises ConfigError
+        text = path.read_text(encoding="utf-8-sig")
+        return cls(project_dir, text.splitlines(), existed=True)
+
+    def patterns(self) -> list[str]:
+        """Active pattern lines, stripped, in file order."""
+        out = []
+        for raw in self.lines:
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                out.append(line)
+        return out
+
+    def excludes(self) -> list[str]:
+        return [p for p in self.patterns() if not p.startswith("!")]
+
+    def includes(self) -> list[str]:
+        return [p[1:] for p in self.patterns() if p.startswith("!")]
+
+    def has(self, line: str) -> bool:
+        return line.strip() in self.patterns()
+
+    def add(self, line: str) -> bool:
+        """Append a pattern line. Returns False if already present or empty."""
+        line = line.strip()
+        if not line or line.startswith("#") or self.has(line):
+            return False
+        self.lines.append(line)
+        return True
+
+    def remove(self, line: str) -> bool:
+        """Remove every occurrence of a pattern line. Returns True if any."""
+        line = line.strip()
+        before = len(self.lines)
+        self.lines = [raw for raw in self.lines if raw.strip() != line]
+        return len(self.lines) != before
+
+    def text(self) -> str:
+        body = list(self.lines)
+        if not self.existed and not any(raw.strip().startswith("#") for raw in body):
+            body = IGNORE_TEMPLATE.rstrip("\n").splitlines() + body
+        return "\n".join(body).rstrip("\n") + "\n"
+
+    def save(self) -> None:
+        """Write atomically: temp file in the same folder, then os.replace."""
+        target = self.path
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".packagerignore.", suffix=".part", dir=str(self.project_dir)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(self.text())
+            os.replace(tmp_name, target)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        self.existed = True
+
+
+def suggest_patterns(rel_posix: str, is_dir: bool) -> dict[str, str]:
+    """Ready-made patterns for one path, keyed by what they do.
+
+    Anchored ("/x") so that excluding src/config.json does not also exclude
+    an unrelated tests/config.json.
+    """
+    rel = rel_posix.strip("/")
+    name = rel.rsplit("/", 1)[-1]
+    out: dict[str, str] = {}
+    if is_dir:
+        out["exclude_this"] = f"/{rel}/"
+        out["exclude_named"] = f"{name}/"
+        out["include_this"] = f"!/{rel}/"
+    else:
+        out["exclude_this"] = f"/{rel}"
+        suffix = Path(name).suffix
+        if suffix and name != suffix:
+            out["exclude_ext"] = f"*{suffix}"
+        out["include_this"] = f"!/{rel}"
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1832,11 +2022,16 @@ files = ["LICENSE", "README.md"]
 IGNORE_TEMPLATE = """\
 # .packagerignore — extra exclusions for project_packager.py
 # One pattern per line. Trailing / marks a directory. Patterns containing /
-# match against the relative path.
+# match against the relative path. A leading / anchors to the project root.
+# A leading ! force-includes, like --include (overrides every exclusion
+# except symlinks and the output archive). Use \\! for a literal leading !.
+#
+# Edit by hand, or visually with:  python project_packager.py --gui
 #
 # docs/
 # *.log
 # data/raw/
+# !data/raw/sample.csv
 """
 
 
@@ -2375,10 +2570,1295 @@ def cmd_package(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# Preview (shared by the GUI; no side effects)
+# --------------------------------------------------------------------------
+
+EXIT_MEANINGS: dict[int, str] = {
+    Exit.OK: "done",
+    Exit.PROBLEMS: "checks failed, or verification found a fault",
+    Exit.BAD_PROJECT: "project path missing or not a directory",
+    Exit.OUTPUT_EXISTS: "that ZIP already exists — tick Overwrite or change the name",
+    Exit.OS_ERROR: "write error, or no verification evidence",
+    Exit.SECRETS: "blocked: secrets, or text that could not be scanned",
+    Exit.CHECKS_FAILED: "blocked: release checks failed — run checks for detail",
+    Exit.PARTIAL: "partial: hash matched, but no manifest to check against",
+    Exit.RESERVED_NAME: "a project file is named PACKAGE_MANIFEST.json",
+    Exit.BAD_CONFIG: "release_check.toml or .packagerignore present but unusable",
+    Exit.CONTAINMENT: "a path escaped the project between scan and write",
+}
+
+
+@dataclass
+class PreviewResult:
+    """Everything `package` would decide, computed without writing anything."""
+
+    project_dir: Path
+    scan: ScanResult
+    secrets: SecretScanResult
+    output_dir: Path
+    output_zip: Path
+    strict: bool
+    scanned_secrets: bool
+
+
+def preview_package(
+    project_dir: Path,
+    *,
+    profile: str = "share",
+    strict: bool = False,
+    ignore_lines: list[str] | None = None,
+    output: str | None = None,
+    name: str | None = None,
+    scan_secrets: bool = True,
+) -> PreviewResult:
+    """Run the same rule building and scan as `package`, read-only.
+
+    `ignore_lines` lets the GUI preview unsaved .packagerignore edits. When it
+    is None the file on disk is loaded, with the same fail-closed handling.
+    """
+    project_dir = project_dir.resolve()
+    effective_strict = strict or profile == "release"
+    if ignore_lines is None:
+        ignore_lines, _ = load_ignore_file(project_dir)
+    output_dir = (
+        Path(output).expanduser().resolve() if output else project_dir.parent / "packaged"
+    )
+    output_zip = output_dir / build_zip_name(project_dir, name)
+    rules = build_rules(
+        profile=profile,
+        strict=effective_strict,
+        ignore_patterns=list(ignore_lines),
+        extra_excludes=[],
+        include_patterns=[],
+    )
+    scan = scan_project(project_dir, rules, output_dir=output_dir, output_zip=output_zip)
+    do_scan = scan_secrets and profile != "backup"
+    secrets = scan_for_secrets(project_dir, scan.included_files) if do_scan else SecretScanResult()
+    return PreviewResult(
+        project_dir=project_dir,
+        scan=scan,
+        secrets=secrets,
+        output_dir=output_dir,
+        output_zip=output_zip,
+        strict=effective_strict,
+        scanned_secrets=do_scan,
+    )
+
+
+# --------------------------------------------------------------------------
+# GUI (tkinter — stdlib, imported only when --gui is used)
+# --------------------------------------------------------------------------
+
+GUI_THEME = {
+    "bg": "#0b0f14",       # Obsidian
+    "panel": "#11161d",    # Panel
+    "border": "#1e2831",   # Border
+    "teal": "#2fd6c3",
+    "green": "#4be08a",    # Phosphor
+    "amber": "#ffb454",
+    "red": "#ff6b6b",
+    "text": "#c8d3da",
+    "dim": "#5f6d78",
+    "select": "#173634",
+}
+
+GUI_FONT_CANDIDATES = (
+    "JetBrains Mono", "Cascadia Mono", "Consolas", "DejaVu Sans Mono",
+    "Menlo", "Courier New",
+)
+
+# status -> (glyph, label, colour key)
+GUI_STATUS = {
+    "included": ("✓", "included", "text"),
+    "forced": ("★", "force-included", "green"),
+    "secret": ("⚠", "POSSIBLE SECRET", "red"),
+    "unscanned": ("?", "not scannable", "amber"),
+    "excluded": ("✕", "excluded", "dim"),
+    "inherited": ("✕", "excluded (parent)", "dim"),
+    "symlink": ("↪", "symlink (skipped)", "amber"),
+    "folder": ("", "", "text"),
+}
+
+
+def cmd_gui(args: argparse.Namespace) -> int:
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        print(
+            "ERROR: the GUI needs tkinter, which this Python does not include.\n"
+            "On Windows, re-run the Python installer and tick 'tcl/tk and IDLE'.\n"
+            "On Debian/Ubuntu: sudo apt install python3-tk",
+            file=sys.stderr,
+        )
+        return EXIT_OS_ERROR
+    project = Path(args.project).expanduser().resolve() if args.project else Path.cwd()
+    if not project.is_dir():
+        print(f"ERROR: not a directory: {project}", file=sys.stderr)
+        return EXIT_BAD_PROJECT
+    app = PackagerGUI(project)
+    app.run()
+    return EXIT_OK
+
+
+class PackagerGUI:
+    """Visual include/exclude editor and runner for project_packager.
+
+    Design rules:
+      - The preview is computed by preview_package(), i.e. the same
+        build_rules/scan_project/scan_for_secrets the CLI uses. The GUI has no
+        matching logic of its own, so it cannot disagree with `package`.
+      - Rules live in .packagerignore. Unsaved edits are previewed live but
+        nothing touches disk until Save.
+      - Packaging, checks and verification run the CLI itself as a
+        subprocess, so exit codes and safety gates are identical.
+      - An unreadable .packagerignore disables editing: saving over it would
+        silently discard whatever exclusions it held.
+    """
+
+    POLL_MS = 60
+    REFRESH_DELAY_MS = 250
+    LAZY_LIMIT = 400
+
+    def __init__(self, project_dir: Path):
+        import queue
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.tk = tk
+        self.ttk = ttk
+        self.queue: "queue.Queue[tuple]" = queue.Queue()
+        self.project_dir = project_dir
+        self.ignore: IgnoreFile | None = None
+        self.ignore_error: str | None = None
+        self.saved_lines: list[str] = []
+        self.undo_stack: list[list[str]] = []
+        self.result: PreviewResult | None = None
+        self.records: dict[str, dict] = {}
+        self.generation = 0
+        self.refresh_job: str | None = None
+        self.proc: subprocess.Popen | None = None
+        self.proc_queue: list[tuple[list[str], str]] = []
+        self.last_zip: Path | None = None
+        self.current_label = ""
+
+        if sys.platform.startswith("win"):
+            try:  # crisp text on high-DPI displays
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        self.root = tk.Tk()
+        self.root.title(f"Project Packager v{TOOL_VERSION}")
+        self.root.geometry("1280x820")
+        self.root.minsize(980, 620)
+        self.root.configure(bg=GUI_THEME["bg"])
+        self._init_fonts()
+        self._init_style()
+        self._build()
+        self._bind_keys()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.load_project(project_dir)
+        self.root.after(self.POLL_MS, self._poll)
+
+    # ---- setup ---------------------------------------------------------
+
+    def _init_fonts(self) -> None:
+        from tkinter import font as tkfont
+
+        families = set(tkfont.families(self.root))
+        family = next((f for f in GUI_FONT_CANDIDATES if f in families), "TkFixedFont")
+        self.font = (family, 10)
+        self.font_bold = (family, 10, "bold")
+        self.font_small = (family, 9)
+        self.font_title = (family, 12, "bold")
+
+    def _init_style(self) -> None:
+        t = GUI_THEME
+        style = self.ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(".", background=t["bg"], foreground=t["text"],
+                        fieldbackground=t["panel"], bordercolor=t["border"],
+                        lightcolor=t["border"], darkcolor=t["border"],
+                        troughcolor=t["bg"], focuscolor=t["teal"],
+                        selectbackground=t["select"], selectforeground=t["text"],
+                        insertcolor=t["text"], font=self.font, relief="flat",
+                        borderwidth=0)
+        style.configure("TFrame", background=t["bg"])
+        style.configure("Panel.TFrame", background=t["panel"])
+        style.configure("TLabel", background=t["bg"], foreground=t["text"])
+        style.configure("Panel.TLabel", background=t["panel"])
+        style.configure("Dim.TLabel", foreground=t["dim"])
+        style.configure("PanelDim.TLabel", background=t["panel"], foreground=t["dim"],
+                        font=self.font_small)
+        style.configure("Title.TLabel", foreground=t["teal"], font=self.font_title)
+        style.configure("Head.TLabel", background=t["panel"], foreground=t["teal"],
+                        font=self.font_bold)
+        style.configure("Warn.TLabel", foreground=t["amber"])
+        style.configure("Err.TLabel", foreground=t["red"])
+        style.configure("TButton", background=t["border"], foreground=t["text"],
+                        padding=(10, 4), borderwidth=1, relief="flat",
+                        bordercolor=t["border"])
+        style.map("TButton",
+                  background=[("disabled", t["panel"]), ("pressed", t["teal"]),
+                              ("active", "#26333e")],
+                  foreground=[("disabled", t["dim"]), ("pressed", t["bg"])])
+        style.configure("Accent.TButton", background=t["teal"], foreground=t["bg"],
+                        font=self.font_bold)
+        style.map("Accent.TButton",
+                  background=[("disabled", t["panel"]), ("active", "#5ee3d4")],
+                  foreground=[("disabled", t["dim"])])
+        style.configure("Danger.TButton", background="#3a1f24", foreground=t["red"])
+        style.map("Danger.TButton", background=[("disabled", t["panel"]),
+                                                ("active", "#4a262c")])
+        for name in ("TCheckbutton", "TRadiobutton"):
+            style.configure(name, background=t["bg"], foreground=t["text"],
+                            indicatorbackground=t["panel"], indicatorforeground=t["teal"],
+                            indicatorrelief="flat", indicatormargin=4)
+            style.map(name,
+                      background=[("active", t["bg"])],
+                      foreground=[("disabled", t["dim"])],
+                      indicatorbackground=[("selected", t["teal"]),
+                                           ("disabled", t["panel"])],
+                      indicatorforeground=[("selected", t["bg"])])
+        style.configure("TEntry", fieldbackground=t["panel"], foreground=t["text"],
+                        insertcolor=t["teal"], padding=4, bordercolor=t["border"])
+        style.map("TEntry", bordercolor=[("focus", t["teal"])],
+                  fieldbackground=[("disabled", t["bg"])])
+        style.configure("TCombobox", fieldbackground=t["panel"], background=t["border"],
+                        foreground=t["text"], arrowcolor=t["text"], padding=3)
+        style.map("TCombobox", fieldbackground=[("readonly", t["panel"])],
+                  foreground=[("readonly", t["text"])],
+                  selectbackground=[("readonly", t["panel"])],
+                  selectforeground=[("readonly", t["text"])])
+        self.root.option_add("*TCombobox*Listbox.background", t["panel"])
+        self.root.option_add("*TCombobox*Listbox.foreground", t["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", t["select"])
+        self.root.option_add("*TCombobox*Listbox.font", self.font)
+        style.configure("Treeview", background=t["panel"], fieldbackground=t["panel"],
+                        foreground=t["text"], rowheight=22, borderwidth=0)
+        style.map("Treeview", background=[("selected", t["select"])],
+                  foreground=[("selected", t["teal"])])
+        style.configure("Treeview.Heading", background=t["border"], foreground=t["teal"],
+                        font=self.font_bold, relief="flat", padding=4)
+        style.map("Treeview.Heading", background=[("active", "#26333e")])
+        for name in ("TScrollbar", "Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(name, background=t["border"], troughcolor=t["bg"],
+                            bordercolor=t["bg"], lightcolor=t["border"],
+                            darkcolor=t["border"], arrowcolor=t["dim"],
+                            borderwidth=0, gripcount=0, arrowsize=12)
+            style.map(name, background=[("active", "#2a3a46"), ("disabled", t["bg"])],
+                      arrowcolor=[("active", t["teal"])])
+        style.configure("TPanedwindow", background=t["bg"])
+        style.configure("Sash", sashthickness=6, background=t["border"])
+
+    def _build(self) -> None:
+        tk, ttk, t = self.tk, self.ttk, GUI_THEME
+        self.var_project = tk.StringVar()
+        self.var_profile = tk.StringVar(value="share")
+        self.var_strict = tk.BooleanVar(value=False)
+        self.var_secrets = tk.BooleanVar(value=True)
+        self.var_filter = tk.StringVar(value="All")
+        self.var_search = tk.StringVar()
+        self.var_name = tk.StringVar()
+        self.var_output = tk.StringVar()
+        self.var_overwrite = tk.BooleanVar(value=False)
+        self.var_clean = tk.BooleanVar(value=False)
+        self.var_check = tk.BooleanVar(value=False)
+        self.var_open = tk.BooleanVar(value=False)
+        self.var_status = tk.StringVar(value="")
+        self.var_dirty = tk.StringVar(value="")
+
+        outer = ttk.Frame(self.root, padding=(12, 10, 12, 8))
+        outer.pack(fill="both", expand=True)
+
+        # Header row ----------------------------------------------------------
+        head = ttk.Frame(outer)
+        head.pack(fill="x")
+        ttk.Label(head, text="PROJECT PACKAGER", style="Title.TLabel").pack(side="left")
+        ttk.Label(head, text=f"  v{TOOL_VERSION}", style="Dim.TLabel").pack(side="left")
+        ttk.Button(head, text="Refresh  F5", command=self.refresh_now).pack(side="right")
+        ttk.Button(head, text="Browse…", command=self.choose_project).pack(side="right", padx=6)
+        entry = ttk.Entry(head, textvariable=self.var_project)
+        entry.pack(side="right", fill="x", expand=True, padx=(24, 0))
+        entry.bind("<Return>", lambda e: self.load_project(Path(self.var_project.get())))
+
+        # Options row -----------------------------------------------------------
+        opts = ttk.Frame(outer, padding=(0, 8, 0, 6))
+        opts.pack(fill="x")
+        ttk.Label(opts, text="Profile").pack(side="left")
+        prof = ttk.Combobox(opts, textvariable=self.var_profile, width=9, state="readonly",
+                            values=("share", "release", "backup"))
+        prof.pack(side="left", padx=(6, 14))
+        prof.bind("<<ComboboxSelected>>", lambda e: self._on_profile())
+        self.chk_strict = ttk.Checkbutton(opts, text="Strict privacy set",
+                                          variable=self.var_strict,
+                                          command=self.schedule_refresh)
+        self.chk_strict.pack(side="left", padx=(0, 14))
+        self.chk_secrets = ttk.Checkbutton(opts, text="Secret-scan preview",
+                                           variable=self.var_secrets,
+                                           command=self.schedule_refresh)
+        self.chk_secrets.pack(side="left")
+        self.lbl_profile = ttk.Label(opts, text="", style="Dim.TLabel")
+        self.lbl_profile.pack(side="left", padx=14)
+
+        # Main split ------------------------------------------------------------
+        paned = ttk.Panedwindow(outer, orient="horizontal")
+
+        left = ttk.Frame(paned)
+        paned.add(left, weight=3)
+        bar = ttk.Frame(left, padding=(0, 0, 0, 6))
+        bar.pack(fill="x")
+        ttk.Label(bar, text="Show").pack(side="left")
+        flt = ttk.Combobox(bar, textvariable=self.var_filter, width=12, state="readonly",
+                           values=("All", "Included", "Excluded", "Attention"))
+        flt.pack(side="left", padx=6)
+        flt.bind("<<ComboboxSelected>>", lambda e: self.repaint())
+        ttk.Label(bar, text="Find").pack(side="left", padx=(10, 0))
+        find = ttk.Entry(bar, textvariable=self.var_search, width=24)
+        find.pack(side="left", padx=6)
+        self.var_search.trace_add("write", lambda *a: self.repaint())
+        ttk.Button(bar, text="Collapse", command=lambda: self._open_all(False)).pack(side="right")
+        ttk.Button(bar, text="Expand", command=lambda: self._open_all(True)).pack(side="right", padx=6)
+
+        tree_wrap = ttk.Frame(left)
+        tree_wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tree_wrap, columns=("status", "size", "why"),
+                                 selectmode="extended")
+        self.tree.heading("#0", text="Path", anchor="w")
+        self.tree.heading("status", text="Status", anchor="w")
+        self.tree.heading("size", text="Size", anchor="e")
+        self.tree.heading("why", text="Rule / reason", anchor="w")
+        self.tree.column("#0", width=360, stretch=True)
+        self.tree.column("status", width=150, stretch=False)
+        self.tree.column("size", width=90, stretch=False, anchor="e")
+        self.tree.column("why", width=260, stretch=True)
+        for status, (_, _, colour) in GUI_STATUS.items():
+            self.tree.tag_configure(status, foreground=t[colour])
+        self.tree.tag_configure("folder_excl", foreground=t["dim"])
+        self.tree.tag_configure("folder_warn", foreground=t["amber"])
+        ysb = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=ysb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        ysb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewOpen>>", self._on_open)
+        self.tree.bind("<Double-1>", self._on_double)
+        self.tree.bind("<space>", lambda e: self.toggle_selected())
+        self.tree.bind("<Return>", lambda e: self.toggle_selected())
+        self.tree.bind("<Button-3>", self._on_context)
+        self.tree.bind("<Button-2>", self._on_context)  # macOS
+        ttk.Label(left, style="Dim.TLabel", text=(
+            "Double-click / Space: toggle in or out   ·   Right-click: more options   ·   "
+            "Ctrl+Z undo   ·   Ctrl+S save"), font=self.font_small).pack(fill="x", pady=(4, 0))
+
+        right = ttk.Frame(paned, style="Panel.TFrame", padding=10)
+        paned.add(right, weight=2)
+        self._build_rules_panel(right)
+
+        # Output + actions ----------------------------------------------------
+        act = ttk.Frame(outer, padding=(0, 8, 0, 0))
+        ttk.Label(act, text="Name").pack(side="left")
+        ttk.Entry(act, textvariable=self.var_name, width=18).pack(side="left", padx=(6, 12))
+        ttk.Label(act, text="Output").pack(side="left")
+        out_entry = ttk.Entry(act, textvariable=self.var_output, width=30)
+        out_entry.pack(side="left", padx=6)
+        ttk.Button(act, text="…", width=2, command=self.choose_output).pack(side="left")
+        self.var_name.trace_add("write", lambda *a: self._update_output_hint())
+        self.var_output.trace_add("write", lambda *a: self._update_output_hint())
+        for text, var in (("Overwrite", self.var_overwrite), ("Clean caches", self.var_clean),
+                          ("Checks first", self.var_check), ("Open folder", self.var_open)):
+            cb = ttk.Checkbutton(act, text=text, variable=var)
+            cb.pack(side="left", padx=(12, 0))
+            if text == "Clean caches":
+                self.chk_clean = cb
+            if text == "Checks first":
+                self.chk_check = cb
+
+        btns = ttk.Frame(outer, padding=(0, 8, 0, 0))
+        self.btn_package = ttk.Button(btns, text="Package", style="Accent.TButton",
+                                      command=lambda: self.run_package(dry=False))
+        self.btn_package.pack(side="left")
+        self.btn_dry = ttk.Button(btns, text="Dry run",
+                                  command=lambda: self.run_package(dry=True))
+        self.btn_dry.pack(side="left", padx=6)
+        self.btn_check = ttk.Button(btns, text="Run checks", command=self.run_checks)
+        self.btn_check.pack(side="left")
+        self.btn_verify = ttk.Button(btns, text="Verify…", command=self.run_verify)
+        self.btn_verify.pack(side="left", padx=6)
+        self.btn_init = ttk.Button(btns, text="Init release_check.toml", command=self.run_init)
+        self.btn_init.pack(side="left")
+        self.btn_stop = ttk.Button(btns, text="Stop", style="Danger.TButton",
+                                   command=self.stop_process, state="disabled")
+        self.btn_stop.pack(side="left", padx=6)
+        self.lbl_output = ttk.Label(btns, text="", style="Dim.TLabel")
+        self.lbl_output.pack(side="right")
+
+        log_wrap = ttk.Frame(outer, padding=(0, 8, 0, 0))
+        self.log = tk.Text(log_wrap, height=7, bg=t["panel"], fg=t["text"],
+                           insertbackground=t["teal"], relief="flat", font=self.font_small,
+                           wrap="none", highlightthickness=1,
+                           highlightbackground=t["border"], highlightcolor=t["border"],
+                           padx=8, pady=6, state="disabled")
+        lsb = ttk.Scrollbar(log_wrap, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=lsb.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        lsb.pack(side="right", fill="y")
+        for tag, colour in (("ok", "green"), ("fail", "red"), ("warn", "amber"),
+                            ("cmd", "teal"), ("dim", "dim")):
+            self.log.tag_configure(tag, foreground=t[colour])
+
+        status = ttk.Frame(outer, padding=(0, 6, 0, 0))
+        ttk.Label(status, textvariable=self.var_status).pack(side="left")
+        self.lbl_dirty = ttk.Label(status, textvariable=self.var_dirty, style="Warn.TLabel")
+        self.lbl_dirty.pack(side="right")
+
+        # Bottom-up, so the tree/rules split takes whatever height is left
+        # and the log and status bar can never be pushed off-screen.
+        status.pack(side="bottom", fill="x")
+        log_wrap.pack(side="bottom", fill="x")
+        btns.pack(side="bottom", fill="x")
+        act.pack(side="bottom", fill="x")
+        paned.pack(fill="both", expand=True)
+        self.paned = paned
+        self.root.after(30, self._place_sash)
+
+        self.menu = tk.Menu(self.root, tearoff=0, bg=t["panel"], fg=t["text"],
+                            activebackground=t["select"], activeforeground=t["teal"],
+                            disabledforeground=t["dim"], relief="flat", bd=1,
+                            font=self.font)
+
+    def _build_rules_panel(self, parent) -> None:
+        tk, ttk, t = self.tk, self.ttk, GUI_THEME
+
+        top = ttk.Frame(parent, style="Panel.TFrame")
+        top.pack(fill="x")
+        ttk.Label(top, text=".packagerignore", style="Head.TLabel").pack(side="left")
+        self.btn_save = ttk.Button(top, text="Save", style="Accent.TButton",
+                                   command=self.save_rules)
+        self.btn_save.pack(side="right")
+        self.btn_revert = ttk.Button(top, text="Revert", command=self.revert_rules)
+        self.btn_revert.pack(side="right", padx=6)
+        self.btn_undo = ttk.Button(top, text="Undo", command=self.undo)
+        self.btn_undo.pack(side="right")
+        self.lbl_ignore_err = ttk.Label(parent, text="", style="Panel.TLabel",
+                                        foreground=t["red"], justify="left",
+                                        wraplength=340)
+        self.lbl_ignore_err.pack(fill="x")
+        wrap_labels: list = []
+        # Packed first, at the bottom, so it is never the thing that gets clipped.
+        foot = ttk.Label(parent, text=(
+            "Built-in exclusions (caches, VCS, venvs, build output, *.zip, session "
+            "debris) can't be removed — force-include to override one."),
+            style="PanelDim.TLabel", justify="left", wraplength=340)
+        foot.pack(side="bottom", anchor="w", fill="x", pady=(8, 0))
+        wrap_labels.append(foot)
+
+        def rule_list(title: str, hint: str, prefix: str):
+            ttk.Label(parent, text=title, style="Head.TLabel").pack(anchor="w", pady=(12, 2))
+            hint_lbl = ttk.Label(parent, text=hint, style="PanelDim.TLabel", justify="left",
+                                 wraplength=340)
+            hint_lbl.pack(anchor="w", fill="x")
+            wrap_labels.append(hint_lbl)
+            wrap = ttk.Frame(parent, style="Panel.TFrame")
+            wrap.pack(fill="both", expand=True, pady=(4, 4))
+            lb = tk.Listbox(wrap, bg=t["bg"], fg=t["text"], selectbackground=t["select"],
+                            selectforeground=t["teal"], relief="flat", font=self.font,
+                            highlightthickness=1, highlightbackground=t["border"],
+                            highlightcolor=t["teal"], activestyle="none",
+                            selectmode="extended", height=5, exportselection=False)
+            sb = ttk.Scrollbar(wrap, orient="vertical", command=lb.yview)
+            lb.configure(yscrollcommand=sb.set)
+            lb.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            row = ttk.Frame(parent, style="Panel.TFrame")
+            row.pack(fill="x")
+            var = tk.StringVar()
+            ent = ttk.Entry(row, textvariable=var)
+            ent.pack(side="left", fill="x", expand=True)
+            def add(_event=None):
+                value = var.get().strip()
+                if prefix:
+                    value = value.lstrip(prefix)
+                self.add_rule(prefix + value if value else "", var)
+            ent.bind("<Return>", add)
+            ttk.Button(row, text="Add", command=add).pack(side="left", padx=(6, 0))
+            ttk.Button(row, text="Remove", command=lambda: self.remove_rules(lb, prefix)
+                       ).pack(side="left", padx=(6, 0))
+            lb.bind("<Delete>", lambda e: self.remove_rules(lb, prefix))
+            lb.bind("<Double-1>", lambda e: self._edit_rule(lb, var, prefix))
+            lb.bind("<<ListboxSelect>>", lambda e: self._highlight_rule(lb, prefix))
+            return lb, ent
+
+        self.lb_excl, self.ent_excl = rule_list(
+            "EXCLUDE",
+            "docs/  any folder named docs  ·  /docs/  only the root one  ·  "
+            "*.log  by name, anywhere  ·  data/raw/  that path and below",
+            "",
+        )
+        self.lb_incl, self.ent_incl = rule_list(
+            "FORCE-INCLUDE  (saved as !pattern)",
+            "Overrides every exclusion, built-in or yours, except symlinks "
+            "and the archive itself. Secret scanning still applies.",
+            "!",
+        )
+        wrap_labels.append(self.lbl_ignore_err)
+        parent.bind("<Configure>", lambda e: [lbl.configure(wraplength=max(200, e.width - 24))
+                                              for lbl in wrap_labels])
+
+    def _place_sash(self) -> None:
+        width = self.paned.winfo_width()
+        if width > 100:
+            self.paned.sashpos(0, int(width * 0.64))
+
+    def _bind_keys(self) -> None:
+        self.root.bind("<F5>", lambda e: self.refresh_now())
+        self.root.bind("<Control-s>", lambda e: self.save_rules())
+        self.root.bind("<Control-z>", lambda e: self.undo())
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    # ---- project + rules state --------------------------------------------
+
+    def load_project(self, project_dir: Path) -> None:
+        if not self._confirm_discard():
+            self.var_project.set(str(self.project_dir))
+            return
+        project_dir = project_dir.expanduser().resolve()
+        if not project_dir.is_dir():
+            self._message("error", "Not a folder", f"{project_dir} is not a directory.")
+            self.var_project.set(str(self.project_dir))
+            return
+        self.project_dir = project_dir
+        self.var_project.set(str(project_dir))
+        self.root.title(f"Project Packager — {project_dir.name}")
+        self.undo_stack.clear()
+        try:
+            self.ignore = IgnoreFile.load(project_dir)
+            self.ignore_error = None
+        except (ConfigError, OSError) as exc:
+            self.ignore = None
+            self.ignore_error = (
+                f"{IGNORE_FILE_NAME} can't be used: {exc}\n"
+                "Editing is disabled so it can't be overwritten. Packaging will "
+                "refuse (exit 9) until it is repaired or removed."
+            )
+        self.saved_lines = list(self.ignore.lines) if self.ignore else []
+        self._sync_rule_lists()
+        self._on_profile()
+        self._update_output_hint()
+
+    def _lines(self) -> list[str]:
+        return self.ignore.patterns() if self.ignore else []
+
+    def is_dirty(self) -> bool:
+        return bool(self.ignore) and self.ignore.lines != self.saved_lines
+
+    def _change_rules(self, mutate) -> bool:
+        """Apply a mutation to the rules with undo support. Returns changed."""
+        if not self.ignore:
+            self._message("error", "Editing disabled", self.ignore_error or "")
+            return False
+        before = list(self.ignore.lines)
+        changed = mutate(self.ignore)
+        if changed and self.ignore.lines != before:
+            self.undo_stack.append(before)
+            del self.undo_stack[:-100]
+            self._sync_rule_lists()
+            self.schedule_refresh()
+            return True
+        return False
+
+    def add_rule(self, line: str, var=None) -> None:
+        if not line or line == "!":
+            return
+        if self._change_rules(lambda ig: ig.add(line)):
+            if var is not None:
+                var.set("")
+            self._set_status(f"Added rule  {line}")
+        else:
+            self._set_status(f"Rule already present: {line}")
+
+    def remove_rules(self, lb, prefix: str) -> None:
+        lines = [prefix + lb.get(i) for i in lb.curselection()]
+        if not lines:
+            return
+        self._change_rules(lambda ig: any([ig.remove(line) for line in lines]))
+        self._set_status("Removed " + ", ".join(lines))
+
+    def _edit_rule(self, lb, var, prefix: str) -> None:
+        sel = lb.curselection()
+        if not sel:
+            return
+        text = lb.get(sel[0])
+        if self._change_rules(lambda ig: ig.remove(prefix + text)):
+            var.set(text)
+            self._set_status("Editing rule — change it and press Enter to re-add")
+
+    def undo(self) -> None:
+        if not self.ignore or not self.undo_stack:
+            return
+        self.ignore.lines = self.undo_stack.pop()
+        self._sync_rule_lists()
+        self.schedule_refresh()
+        self._set_status("Undone")
+
+    def revert_rules(self) -> None:
+        if not self.ignore or not self.is_dirty():
+            return
+        self.undo_stack.append(list(self.ignore.lines))
+        self.ignore.lines = list(self.saved_lines)
+        self._sync_rule_lists()
+        self.schedule_refresh()
+
+    def save_rules(self) -> bool:
+        if not self.ignore:
+            self._message("error", "Editing disabled", self.ignore_error or "")
+            return False
+        try:
+            self.ignore.save()
+            # Re-read through the strict loader: what is on disk is what counts.
+            self.ignore = IgnoreFile.load(self.project_dir)
+        except (ConfigError, OSError) as exc:
+            self._message("error", "Save failed", str(exc))
+            return False
+        self.saved_lines = list(self.ignore.lines)
+        self._sync_rule_lists()
+        self._set_status(f"Saved {self.ignore.path}")
+        return True
+
+    def _confirm_discard(self) -> bool:
+        if not self.is_dirty():
+            return True
+        from tkinter import messagebox
+        answer = messagebox.askyesnocancel(
+            "Unsaved rules", f"Save changes to {IGNORE_FILE_NAME} first?", parent=self.root)
+        if answer is None:
+            return False
+        if answer:
+            return self.save_rules()
+        return True
+
+    def _sync_rule_lists(self) -> None:
+        for lb, values in ((self.lb_excl, self.ignore.excludes() if self.ignore else []),
+                           (self.lb_incl, self.ignore.includes() if self.ignore else [])):
+            lb.delete(0, "end")
+            for value in values:
+                lb.insert("end", value)
+        state = "normal" if self.ignore else "disabled"
+        for widget in (self.lb_excl, self.lb_incl, self.ent_excl, self.ent_incl):
+            widget.configure(state=state)
+        self.lbl_ignore_err.configure(text=self.ignore_error or "")
+        dirty = self.is_dirty()
+        self.var_dirty.set(f"● unsaved changes to {IGNORE_FILE_NAME}" if dirty else "")
+        self.btn_save.configure(state="normal" if dirty else "disabled")
+        self.btn_revert.configure(state="normal" if dirty else "disabled")
+        self.btn_undo.configure(state="normal" if self.undo_stack else "disabled")
+
+    def _on_profile(self) -> None:
+        profile = self.var_profile.get()
+        notes = {
+            "share": "standard exclusions · secrets warn",
+            "release": "strict + clean + checks · secrets BLOCK",
+            "backup": "minimal exclusions · no secret scan",
+        }
+        self.lbl_profile.configure(text=notes.get(profile, ""))
+        release = profile == "release"
+        self.chk_strict.configure(state="disabled" if release else "normal")
+        self.chk_clean.configure(state="disabled" if release else "normal")
+        self.chk_check.configure(state="disabled" if release else "normal")
+        self.chk_secrets.configure(state="disabled" if profile == "backup" else "normal")
+        self.schedule_refresh()
+
+    # ---- preview -----------------------------------------------------------
+
+    def schedule_refresh(self) -> None:
+        if self.refresh_job:
+            self.root.after_cancel(self.refresh_job)
+        self.refresh_job = self.root.after(self.REFRESH_DELAY_MS, self.refresh_now)
+
+    def refresh_now(self) -> None:
+        import threading
+
+        self.refresh_job = None
+        self.generation += 1
+        gen = self.generation
+        if self.ignore_error:
+            self.result = None
+            self.records = {}
+            self.repaint()
+            self._set_status("Preview unavailable: " + IGNORE_FILE_NAME + " is unusable")
+            return
+        params = dict(
+            profile=self.var_profile.get(),
+            strict=self.var_strict.get(),
+            ignore_lines=self._lines(),
+            output=self.var_output.get().strip() or None,
+            name=self.var_name.get().strip() or None,
+            scan_secrets=self.var_secrets.get(),
+        )
+        project = self.project_dir
+        self._set_status("Scanning…")
+
+        def work():
+            try:
+                res = preview_package(project, **params)
+                self.queue.put(("preview", gen, res))
+            except Exception as exc:  # reported, never swallowed
+                self.queue.put(("preview_error", gen, exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll(self) -> None:
+        import queue as _q
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                kind = msg[0]
+                if kind == "preview" and msg[1] == self.generation:
+                    self.result = msg[2]
+                    self._build_records()
+                    self.repaint()
+                elif kind == "preview_error" and msg[1] == self.generation:
+                    self._set_status(f"Preview failed: {msg[2]}")
+                elif kind == "log":
+                    self._log(msg[1])
+                elif kind == "proc_done":
+                    self._proc_done(msg[1], msg[2])
+        except _q.Empty:
+            pass
+        self.root.after(self.POLL_MS, self._poll)
+
+    def _build_records(self) -> None:
+        res = self.result
+        records: dict[str, dict] = {}
+        if res is None:
+            self.records = records
+            return
+        base = res.project_dir
+        forced = {p for p in res.scan.force_included}
+        secrets: dict[str, list[str]] = {}
+        for f in res.secrets.findings:
+            secrets.setdefault(normalise_rel(f.rel_path), []).append(f"{f.label} (line {f.line})")
+        unscanned = {normalise_rel(u.path): u.reason for u in res.secrets.unscanned_text_files()}
+        lines = self._lines()
+
+        for path in res.scan.included_files:
+            rel = normalise_rel(path.relative_to(base))
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            status, why = "included", ""
+            if path in forced:
+                status = "forced"
+                why = "force-include: " + ", ".join(user_includes_matching(rel, lines) or ["(rule)"])
+            if rel in secrets:
+                status, why = "secret", "; ".join(secrets[rel])
+            elif rel in unscanned:
+                status, why = "unscanned", unscanned[rel]
+            records[rel] = dict(kind="file", status=status, why=why, size=size)
+
+        for d in res.scan.excluded:
+            rel = normalise_rel(d.rel_path)
+            if rel in ("", "."):
+                continue
+            is_dir = d.path.is_dir()
+            records[rel] = dict(kind="dir" if is_dir else "file", status="excluded",
+                                why=d.reason, size=None, lazy=is_dir)
+        for d in res.scan.skipped_symlinks:
+            rel = normalise_rel(d.rel_path)
+            records[rel] = dict(kind="file", status="symlink", why=d.reason, size=None)
+        self.records = records
+
+    def _visible(self, rel: str, rec: dict) -> bool:
+        flt = self.var_filter.get()
+        needle = self.var_search.get().strip().lower()
+        if needle and needle not in rel.lower():
+            return False
+        status = rec["status"]
+        if flt == "Included":
+            return status in ("included", "forced", "secret", "unscanned")
+        if flt == "Excluded":
+            return status in ("excluded", "inherited", "symlink")
+        if flt == "Attention":
+            return status in ("secret", "unscanned", "symlink", "forced")
+        return True
+
+    def repaint(self) -> None:
+        tree = self.tree
+        opened = {iid for iid in self._all_items() if tree.item(iid, "open")}
+        selected = set(tree.selection())
+        first_paint = not getattr(self, "_painted", False)
+        tree.delete(*tree.get_children(""))
+        filtering = self.var_filter.get() != "All" or bool(self.var_search.get().strip())
+
+        visible = {rel: rec for rel, rec in self.records.items() if self._visible(rel, rec)}
+        # Every visible item needs its ancestor folders.
+        folders: dict[str, dict] = {}
+        for rel, rec in visible.items():
+            parts = rel.split("/")
+            for depth in range(1, len(parts)):
+                folder = "/".join(parts[:depth])
+                if folder in visible:
+                    continue
+                agg = folders.setdefault(folder, dict(inc=0, exc=0, size=0, warn=0))
+                if rec["status"] in ("included", "forced", "secret", "unscanned"):
+                    agg["inc"] += 1
+                    agg["size"] += rec.get("size") or 0
+                else:
+                    agg["exc"] += 1
+                if rec["status"] in ("secret", "unscanned", "symlink"):
+                    agg["warn"] += 1
+
+        children: dict[str, list[tuple[bool, str]]] = {}
+        for rel in list(visible) + list(folders):
+            parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+            is_dir = rel in folders or visible.get(rel, {}).get("kind") == "dir"
+            children.setdefault(parent, []).append((is_dir, rel))
+
+        def insert(parent: str) -> None:
+            for is_dir, rel in sorted(children.get(parent, []),
+                                      key=lambda x: (not x[0], x[1].lower())):
+                name = rel.rsplit("/", 1)[-1] + ("/" if is_dir else "")
+                if rel in folders:
+                    agg = folders[rel]
+                    status_text = f"{agg['inc']} in" + (f" · {agg['exc']} out" if agg["exc"] else "")
+                    tag = "folder_warn" if agg["warn"] else ("folder_excl" if not agg["inc"] else "folder")
+                    tree.insert(parent, "end", iid=rel, text="  " + name,
+                                values=(status_text, format_bytes(agg["size"]) if agg["size"] else "", ""),
+                                tags=(tag,),
+                                open=filtering or rel in opened or (first_paint and "/" not in rel))
+                    insert(rel)
+                else:
+                    rec = visible[rel]
+                    glyph, label, _ = GUI_STATUS[rec["status"]]
+                    size = format_bytes(rec["size"]) if rec.get("size") is not None else ""
+                    tree.insert(parent, "end", iid=rel, text=f"{glyph} {name}",
+                                values=(label, size, rec.get("why", "")),
+                                tags=(rec["status"],))
+                    if rec.get("lazy"):
+                        tree.insert(rel, "end", iid=rel + "/\0lazy", text="…")
+                        if rel in opened:
+                            tree.item(rel, open=True)
+                            self._fill_lazy(rel)
+
+        insert("")
+        self._painted = True
+        keep = [iid for iid in selected if tree.exists(iid)]
+        if keep:
+            tree.selection_set(keep)
+        self._update_summary()
+
+    def _fill_lazy(self, rel: str) -> None:
+        """List the inside of an excluded folder on demand (never followed links)."""
+        tree = self.tree
+        dummy = rel + "/\0lazy"
+        if not tree.exists(dummy):
+            return
+        tree.delete(dummy)
+        folder = self.project_dir / rel
+        try:
+            entries = sorted(os.scandir(folder), key=lambda e: (not e.is_dir(follow_symlinks=False),
+                                                                e.name.lower()))
+        except OSError as exc:
+            tree.insert(rel, "end", text=f"(cannot list: {exc})", tags=("excluded",))
+            return
+        for entry in entries[: self.LAZY_LIMIT]:
+            child = f"{rel}/{entry.name}"
+            if tree.exists(child):
+                continue
+            is_link = entry.is_symlink()
+            is_dir = entry.is_dir(follow_symlinks=False)
+            status = "symlink" if is_link else "inherited"
+            why = "symlink — never packaged" if is_link else f"inside excluded {rel}/"
+            self.records.setdefault(child, dict(kind="dir" if is_dir else "file",
+                                                status=status, why=why, size=None,
+                                                lazy=is_dir and not is_link, virtual=True))
+            glyph, label, _ = GUI_STATUS[status]
+            tree.insert(rel, "end", iid=child, text=f"{glyph} {entry.name}{'/' if is_dir else ''}",
+                        values=(label, "", why), tags=(status,))
+            if is_dir and not is_link:
+                tree.insert(child, "end", iid=child + "/\0lazy", text="…")
+        if len(entries) > self.LAZY_LIMIT:
+            tree.insert(rel, "end", text=f"… {len(entries) - self.LAZY_LIMIT} more not shown",
+                        tags=("excluded",))
+
+    def _on_open(self, _event=None) -> None:
+        iid = self.tree.focus()
+        if iid and self.tree.exists(iid + "/\0lazy"):
+            self._fill_lazy(iid)
+
+    def _all_items(self, parent: str = ""):
+        for iid in self.tree.get_children(parent):
+            yield iid
+            yield from self._all_items(iid)
+
+    def _open_all(self, state: bool) -> None:
+        for iid in list(self._all_items()):
+            if iid in self.records and self.records[iid].get("lazy"):
+                continue  # don't expand excluded trees like node_modules
+            if self.tree.get_children(iid):
+                self.tree.item(iid, open=state)
+
+    def _update_summary(self) -> None:
+        res = self.result
+        if res is None:
+            return
+        inc = len(res.scan.included_files)
+        size = sum((r.get("size") or 0) for r in self.records.values()
+                   if r["status"] in ("included", "forced", "secret", "unscanned"))
+        bits = [f"{inc} files in  ·  {format_bytes(size)}",
+                f"{len(res.scan.excluded)} excluded"]
+        if res.scan.force_included:
+            bits.append(f"{len(res.scan.force_included)} forced")
+        if res.secrets.findings:
+            bits.append(f"⚠ {len(res.secrets.findings)} possible secret(s)")
+        if res.secrets.unscanned_text_files():
+            bits.append(f"{len(res.secrets.unscanned_text_files())} unscannable")
+        if res.scan.skipped_symlinks:
+            bits.append(f"{len(res.scan.skipped_symlinks)} symlinks skipped")
+        if not res.scanned_secrets:
+            bits.append("secret scan off")
+        self._set_status("   ·   ".join(bits))
+
+    def _update_output_hint(self) -> None:
+        out = self.var_output.get().strip()
+        out_dir = Path(out).expanduser() if out else self.project_dir.parent / "packaged"
+        name = build_zip_name(self.project_dir, self.var_name.get().strip() or None)
+        self.lbl_output.configure(text=f"→ {out_dir / name}")
+        self.schedule_refresh()
+
+    def _highlight_rule(self, lb, prefix: str) -> None:
+        sel = lb.curselection()
+        if not sel or not self.records:
+            return
+        line = prefix + lb.get(sel[0])
+        hits = []
+        for rel, rec in self.records.items():
+            if prefix == "!":
+                if user_includes_matching(rel, [line]):
+                    hits.append(rel)
+            elif user_rules_excluding(rel, rec["kind"] == "dir", [line]):
+                hits.append(rel)
+        shown = [h for h in hits if self.tree.exists(h)]
+        for rel in shown:
+            parent = self.tree.parent(rel)
+            while parent:
+                self.tree.item(parent, open=True)
+                parent = self.tree.parent(parent)
+        if shown:
+            self.tree.selection_set(shown)
+            self.tree.see(shown[0])
+        self._set_status(f"{line}  matches {len(hits)} item(s) in this preview")
+
+    # ---- tree actions -----------------------------------------------------
+
+    def _item_info(self, iid: str) -> tuple[str, bool, str] | None:
+        """(rel, is_dir, status) for a tree item, or None for placeholders."""
+        if not iid or "\0" in iid:
+            return None
+        rec = self.records.get(iid)
+        if rec is not None:
+            return iid, rec["kind"] == "dir", rec["status"]
+        if self.tree.exists(iid) and self.tree.get_children(iid):
+            return iid, True, "folder"
+        return None
+
+    def toggle(self, iid: str) -> None:
+        info = self._item_info(iid)
+        if not info:
+            return
+        rel, is_dir, status = info
+        lines = self._lines()
+        sugg = suggest_patterns(rel, is_dir)
+        if status == "symlink":
+            self._set_status("Symlinks are never packaged — this cannot be overridden.")
+            return
+        if status in ("included", "secret", "unscanned", "folder"):
+            self.add_rule(sugg["exclude_this"])
+        elif status == "forced":
+            own = [inc for inc in user_includes_matching(rel, lines)]
+            exact = [i for i in own if "!" + i == sugg["include_this"]]
+            if exact:
+                self._change_rules(lambda ig: ig.remove(sugg["include_this"]))
+                self._set_status(f"Removed {sugg['include_this']}")
+            else:
+                self.add_rule(sugg["exclude_this"])
+                if own:
+                    self._set_status(
+                        f"Also force-included by {', '.join('!' + o for o in own)} — "
+                        "remove that rule to exclude it")
+        else:  # excluded / inherited
+            if sugg["exclude_this"] in lines:
+                self._change_rules(lambda ig: ig.remove(sugg["exclude_this"]))
+                self._set_status(f"Removed {sugg['exclude_this']}")
+            else:
+                self.add_rule(sugg["include_this"])
+
+    def toggle_selected(self) -> None:
+        for iid in list(self.tree.selection()):
+            self.toggle(iid)
+
+    def _on_double(self, event) -> str | None:
+        iid = self.tree.identify_row(event.y)
+        info = self._item_info(iid)
+        if info and info[1]:
+            # Folders only expand/collapse on double-click. Toggling one is a
+            # bulk action (double-clicking .git to look inside must not
+            # force-include it), so it needs Space or the context menu.
+            return None
+        if iid:
+            self.toggle(iid)
+            return "break"
+        return None
+
+    def _on_context(self, event) -> None:
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        info = self._item_info(iid)
+        if not info:
+            return
+        rel, is_dir, status = info
+        lines = self._lines()
+        sugg = suggest_patterns(rel, is_dir)
+        menu = self.menu
+        menu.delete(0, "end")
+        menu.add_command(label=rel + ("/" if is_dir else ""), state="disabled")
+        menu.add_separator()
+        editable = "normal" if self.ignore else "disabled"
+        if status == "symlink":
+            menu.add_command(label="Symlinks are never packaged", state="disabled")
+        elif status in ("excluded", "inherited"):
+            mine = user_rules_excluding(rel, is_dir, lines)
+            for line in mine:
+                menu.add_command(label=f"Remove rule   {line}", state=editable,
+                                 command=lambda l=line: self._remove_line(l))
+            if not mine:
+                menu.add_command(label="Excluded by a built-in rule", state="disabled")
+            menu.add_command(label=f"Force-include   {sugg['include_this']}", state=editable,
+                             command=lambda: self.add_rule(sugg["include_this"]))
+        else:
+            if is_dir:
+                # A folder can be excluded yet still shown, when a force-include
+                # reaches inside it. Its rule should still be removable here.
+                for line in user_rules_excluding(rel, True, lines):
+                    menu.add_command(label=f"Remove rule   {line}", state=editable,
+                                     command=lambda l=line: self._remove_line(l))
+            menu.add_command(label=f"Exclude this   {sugg['exclude_this']}", state=editable,
+                             command=lambda: self.add_rule(sugg["exclude_this"]))
+            if "exclude_ext" in sugg:
+                menu.add_command(label=f"Exclude every   {sugg['exclude_ext']}",
+                                 state=editable,
+                                 command=lambda: self.add_rule(sugg["exclude_ext"]))
+            if "exclude_named" in sugg:
+                menu.add_command(label=f"Exclude every folder   {sugg['exclude_named']}",
+                                 state=editable,
+                                 command=lambda: self.add_rule(sugg["exclude_named"]))
+            for inc in user_includes_matching(rel, lines):
+                menu.add_command(label=f"Remove force-include   !{inc}", state=editable,
+                                 command=lambda l="!" + inc: self._remove_line(l))
+        menu.add_separator()
+        menu.add_command(label="Copy relative path", command=lambda: self._copy(rel))
+        menu.add_command(label="Show in file manager",
+                         command=lambda: open_folder(self.project_dir / (rel if is_dir else
+                                                                         str(Path(rel).parent))))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _remove_line(self, line: str) -> None:
+        if self._change_rules(lambda ig: ig.remove(line)):
+            self._set_status(f"Removed {line}")
+
+    def _copy(self, text: str) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._set_status(f"Copied {text}")
+
+    # ---- running the CLI ---------------------------------------------------
+
+    def _cli(self, *args: str) -> list[str]:
+        return [sys.executable, str(Path(__file__).resolve()), *args]
+
+    def run_package(self, *, dry: bool) -> None:
+        if self.ignore_error:
+            self._message("error", "Cannot package", self.ignore_error)
+            return
+        if self.is_dirty():
+            from tkinter import messagebox
+            if not messagebox.askokcancel(
+                    "Save rules?",
+                    f"Packaging uses {IGNORE_FILE_NAME} on disk.\n\n"
+                    "Save your rule changes and continue?", parent=self.root):
+                return
+            if not self.save_rules():
+                return
+        profile = self.var_profile.get()
+        args = ["package", str(self.project_dir), "--profile", profile]
+        if self.var_strict.get() and profile != "release":
+            args.append("--strict")
+        if self.var_clean.get() and profile != "release":
+            args.append("--clean")
+        if self.var_check.get() and profile != "release":
+            args.append("--check")
+        if self.var_overwrite.get():
+            args.append("--overwrite")
+        if self.var_name.get().strip():
+            args += ["--name", self.var_name.get().strip()]
+        if self.var_output.get().strip():
+            args += ["--output", self.var_output.get().strip()]
+        if dry:
+            args += ["--dry-run", "--list-included"]
+        elif self.var_open.get():
+            args.append("--open")
+        self._start([(self._cli(*args), "dry" if dry else "package")])
+
+    def run_checks(self) -> None:
+        self._start([(self._cli("check", str(self.project_dir)), "check")])
+
+    def run_init(self) -> None:
+        self._start([(self._cli("init", str(self.project_dir)), "init")])
+
+    def run_verify(self, path: Path | None = None) -> None:
+        if path is None:
+            from tkinter import filedialog
+            out = self.var_output.get().strip()
+            start = Path(out).expanduser() if out else self.project_dir.parent / "packaged"
+            chosen = filedialog.askopenfilename(
+                parent=self.root, title="Verify archive",
+                initialdir=str(start if start.is_dir() else self.project_dir),
+                filetypes=[("ZIP archives", "*.zip"), ("All files", "*.*")])
+            if not chosen:
+                return
+            path = Path(chosen)
+        self._start([(self._cli("verify", str(path)), "verify")])
+
+    def _start(self, jobs: list[tuple[list[str], str]]) -> None:
+        import threading
+
+        if self.proc is not None:
+            self._set_status("Already running — wait or press Stop.")
+            return
+        cmd, label = jobs[0]
+        self.proc_queue = jobs[1:]
+        self.current_label = label
+        self.last_zip = None
+        shown = " ".join(f'"{c}"' if " " in c else c for c in cmd[1:])
+        self._log(f"\n$ python {shown}\n", "cmd")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                errors="replace", env=env, creationflags=flags, bufsize=1)
+        except OSError as exc:
+            self._log(f"could not start: {exc}\n", "fail")
+            self.proc = None
+            return
+        self._set_running(True)
+        proc = self.proc
+
+        def pump():
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                self.queue.put(("log", line))
+            code = proc.wait()
+            self.queue.put(("proc_done", code, label))
+
+        threading.Thread(target=pump, daemon=True).start()
+
+    def stop_process(self) -> None:
+        if self.proc is not None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+            self.proc_queue = []
+
+    def _proc_done(self, code: int, label: str) -> None:
+        self.proc = None
+        self._set_running(False)
+        meaning = EXIT_MEANINGS.get(code, "stopped" if code < 0 else "unknown exit code")
+        self._log(f"── exit {code}: {meaning}\n", "ok" if code == 0 else "fail")
+        if label == "package" and code == 0 and self.last_zip and self.last_zip.is_file():
+            self._log("Verifying the new archive…\n", "dim")
+            self._start([(self._cli("verify", str(self.last_zip)), "verify")])
+            return
+        if label == "init":
+            self.load_project(self.project_dir)
+        elif label == "package":
+            self.schedule_refresh()  # --clean may have changed the tree
+
+    def _set_running(self, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for btn in (self.btn_package, self.btn_dry, self.btn_check, self.btn_verify,
+                    self.btn_init):
+            btn.configure(state=state)
+        self.btn_stop.configure(state="normal" if running else "disabled")
+
+    def _log(self, line: str, tag: str | None = None) -> None:
+        if tag is None:
+            s = line.lstrip()
+            if s.startswith(("OK", "RESULT: OK", "WROTE", "DONE")):
+                tag = "ok"
+            elif s.startswith(("FAIL", "ERROR", "RESULT: FAIL", "!!", "BLOCKED")):
+                tag = "fail"
+            elif s.startswith(("WARN", "NOT SCANNED", "RESULT: PARTIAL", "SKIP")):
+                tag = "warn"
+            elif s.startswith("+ "):
+                tag = "dim"
+        if line.startswith("Output ZIP:"):
+            self.last_zip = Path(line.split(":", 1)[1].strip())
+            if self.current_label != "package":
+                self.last_zip = None
+        self.log.configure(state="normal")
+        self.log.insert("end", line, (tag,) if tag else ())
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    # ---- misc ---------------------------------------------------------------
+
+    def choose_project(self) -> None:
+        from tkinter import filedialog
+        chosen = filedialog.askdirectory(parent=self.root, initialdir=str(self.project_dir),
+                                         title="Choose project folder")
+        if chosen:
+            self.load_project(Path(chosen))
+
+    def choose_output(self) -> None:
+        from tkinter import filedialog
+        chosen = filedialog.askdirectory(parent=self.root, title="Choose output folder",
+                                         initialdir=str(self.project_dir.parent))
+        if chosen:
+            self.var_output.set(chosen)
+
+    def _set_status(self, text: str) -> None:
+        self.var_status.set(text)
+
+    def _message(self, kind: str, title: str, text: str) -> None:
+        from tkinter import messagebox
+        getattr(messagebox, "showerror" if kind == "error" else "showinfo")(
+            title, text, parent=self.root)
+
+    def on_close(self) -> None:
+        if not self._confirm_discard():
+            return
+        if self.proc is not None:
+            self.stop_process()
+        self.root.destroy()
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
-KNOWN_COMMANDS = {"package", "check", "verify", "init"}
+KNOWN_COMMANDS = {"package", "check", "verify", "init", "gui"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2460,6 +3940,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Project directory to initialise.")
     i.set_defaults(func=cmd_init)
 
+    # -- gui --------------------------------------------------------------
+    g = sub.add_parser(
+        "gui",
+        help="Open the visual include/exclude editor (also: --gui).",
+    )
+    g.add_argument("project", nargs="?", default=".",
+                   help="Project directory to open.")
+    g.set_defaults(func=cmd_gui)
+
     return parser
 
 
@@ -2472,6 +3961,17 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     raw = list(argv) if argv is not None else sys.argv[1:]
+
+    # `--gui [project]` (or `-gui`) anywhere opens the GUI. Any other option
+    # alongside it is refused rather than silently ignored.
+    if "--gui" in raw or "-gui" in raw:
+        rest = [a for a in raw if a not in ("--gui", "-gui", "gui", "package")]
+        flags = [a for a in rest if a.startswith("-")]
+        if flags or len(rest) > 1:
+            print("ERROR: --gui takes only an optional project folder "
+                  f"(got: {' '.join(rest)})", file=sys.stderr)
+            return EXIT_PROBLEMS
+        raw = ["gui"] + rest
 
     # Backward compatibility: `project_packager.py .` still packages.
     if raw and raw[0] not in KNOWN_COMMANDS and not raw[0].startswith("-"):

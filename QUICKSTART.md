@@ -99,7 +99,24 @@ data/raw/           that specific subtree
 *.csv               any CSV file
 ```
 
+!data/raw/sample.csv force-include: rescue one file the rules above dropped
+```
+
+A leading `!` force-includes, exactly like `--include`; `\!` means a literal `!`.
 Windows-style backslashes are fine — `data\raw\` means the same thing.
+
+**Visually, without editing the file:**
+
+```bash
+python project_packager.py --gui            # or: gui . / double-click packager_gui.bat
+```
+
+The GUI shows the whole project as a tree with every file marked in, out, or
+forced, and why. Double-click a file (or press Space on anything) to flip it;
+right-click for "exclude every `*.log`", "remove the rule that excluded this",
+and so on. Edits preview live and are only written to `.packagerignore` when you
+press Save. Package, Dry run, Run checks and Verify run the normal CLI, so the
+results and exit codes are the same as from a terminal.
 
 If `.packagerignore` exists but can't be read, packaging **fails** rather than
 carrying on without your exclusions. That's on purpose: an unreadable ignore
@@ -222,6 +239,9 @@ python project_packager.py verify handoff_2026-07-19_1430.zip
 
 # Gates only, no packaging
 python project_packager.py check .
+
+# Pick includes/excludes visually
+python project_packager.py --gui
 
 # Rescue something the defaults dropped
 python project_packager.py package . --include "docs/diagrams/*.png"

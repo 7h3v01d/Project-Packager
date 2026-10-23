@@ -50,6 +50,9 @@ echo   RELEASE GATES
 echo     8.  Run checks       Test the project without packaging.
 echo     9.  Set up config    Write starter release_check.toml + .packagerignore.
 echo.
+echo   VISUAL
+echo     G.  GUI              Pick includes/excludes in a window, then package.
+echo.
 echo     H.  Help             What the profiles and exit codes mean.
 echo     Q.  Quit
 echo.
@@ -66,6 +69,7 @@ if /i "%CHOICE%"=="6" goto :custom
 if /i "%CHOICE%"=="7" goto :verify
 if /i "%CHOICE%"=="8" goto :checks
 if /i "%CHOICE%"=="9" goto :init
+if /i "%CHOICE%"=="G" goto :gui
 if /i "%CHOICE%"=="H" goto :help
 if /i "%CHOICE%"=="Q" goto :quit
 goto :menu
@@ -243,6 +247,15 @@ echo.
 call :confirm "Write starter config here"
 if errorlevel 1 goto :menu
 "%PYTHON%" "%PACKAGER%" init "%PROJECT%"
+call :report %ERRORLEVEL%
+goto :menu
+
+:gui
+call :banner "GUI - opens in its own window"
+echo   Toggle files in or out, save to .packagerignore, package from there.
+echo   Close the window to come back to this menu.
+echo.
+"%PYTHON%" "%PACKAGER%" gui "%PROJECT%"
 call :report %ERRORLEVEL%
 goto :menu
 

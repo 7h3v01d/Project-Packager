@@ -2,6 +2,34 @@
 
 All notable changes to Project Packager are recorded here.
 
+## Unreleased — GUI
+
+### Added
+
+- **`--gui` / `gui` subcommand: a visual include/exclude editor.** Tree preview
+  of the whole project with per-file status and reason, toggle in/out by
+  double-click or Space, context-menu rule actions, live preview of unsaved
+  edits, undo, and buttons that run package / dry run / check / verify / init
+  through the CLI itself. Standard library only (tkinter), imported lazily so
+  the CLI still runs on a Python built without Tk.
+- **`!pattern` lines in `.packagerignore` force-include**, with exactly the
+  power of `--include`, so includes no longer have to be retyped on every run.
+  `\!` escapes a literal `!`. Old builds read a `!` line as a literal
+  exclusion that matches nothing they would otherwise have shipped, so a file
+  written for this version fails safe on an older one.
+- `preview_package()`, `IgnoreFile`, `user_rules_excluding()`,
+  `user_includes_matching()` and `suggest_patterns()` — the read-only engine
+  pieces the GUI is built on, usable from tests and scripts.
+
+### Fixed
+
+- **Anchored force-includes were silently ignored.** `--include "/notes.txt"`
+  was matched verbatim against relative paths, which never begin with `/`, so
+  it did nothing and gave no warning — the same defect fixed for exclusions in
+  3.0.1. Leading-slash includes now anchor to the project root, both for
+  matching and for reopening an excluded directory.
+  Revert-proven: `tests/test_gui_rules.py::test_anchored_include_*`.
+
 ## 3.0.1 — Safety hotfix
 
 ### Test-infrastructure corrections

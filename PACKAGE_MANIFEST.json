@@ -1,10 +1,10 @@
 {
   "tool": "project_packager",
   "version": "3.0.1",
-  "created_utc": "2026-07-29T04:32:29+00:00",
-  "project": "project_packager",
-  "file_count": 24,
-  "total_bytes": 280670,
+  "created_utc": "2026-10-23T14:09:43+00:00",
+  "project": "src",
+  "file_count": 18,
+  "total_bytes": 246749,
   "files": [
     {
       "path": ".github/workflows/tests.yml",
@@ -17,14 +17,9 @@
       "sha256": "1dc87832f002b803046a3a3e7c63418bf7c14c1a6961325c9bebcd6fb7e36551"
     },
     {
-      "path": "build.bat",
-      "size": 61,
-      "sha256": "25acb35a618a5e8034304b8e52341cb295d97f6493b7eef70c6cd469173e6f37"
-    },
-    {
       "path": "CHANGELOG.md",
-      "size": 13763,
-      "sha256": "76ceafa56fa5380d29eb6d39caa0580372b4dd17026cf19685c3422148b664c0"
+      "size": 15238,
+      "sha256": "6765948636f4ba3f538f1c8793035b9ddf37d76cfab70b3c8256ebd6e437db1c"
     },
     {
       "path": "LICENSE",
@@ -32,9 +27,29 @@
       "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
     },
     {
+      "path": "QUICKSTART.md",
+      "size": 7919,
+      "sha256": "0d54e3a8b9938759af60744c2dfc358f4f65901d9c7b9c4c38a3ac2b86476636"
+    },
+    {
+      "path": "README.md",
+      "size": 16064,
+      "sha256": "fcf22b49829ac27404f507da16d227b18e9ae546de313ac886f860f86f793917"
+    },
+    {
+      "path": "build.bat",
+      "size": 61,
+      "sha256": "25acb35a618a5e8034304b8e52341cb295d97f6493b7eef70c6cd469173e6f37"
+    },
+    {
       "path": "package.bat",
-      "size": 13820,
-      "sha256": "d4c1eb4f43c7b52464a84f18e966bea32da5cf5bd08816d185e61928bf1d7b65"
+      "size": 14213,
+      "sha256": "a1691eb96189fa71ed6d1aecdf57985a2daa0794d1ff8dd7b6faa95e29e31e35"
+    },
+    {
+      "path": "packager_gui.bat",
+      "size": 291,
+      "sha256": "bfe0e83de5914742a46c9f3395be5736abadc6a2419c230f2a6c6be16380fd77"
     },
     {
       "path": "packit.bat",
@@ -43,23 +58,13 @@
     },
     {
       "path": "project_packager.py",
-      "size": 93695,
-      "sha256": "e6de1c2fb87b0f6b547fd7c55726772dc362053bd5bd96bc3cadced65b881708"
+      "size": 161390,
+      "sha256": "fd05dcc186f2d821c60d54bef274335ee8c836bf90e0f3e3dd4379d073cdeaed"
     },
     {
       "path": "pytest.ini",
       "size": 412,
       "sha256": "23698e7b0ba1f295202c4a96f86727e821bf5d0ed456a70431464b9f672aedae"
-    },
-    {
-      "path": "QUICKSTART.md",
-      "size": 7095,
-      "sha256": "1790899923fca4b2b8b0b70a1669023c2768f5dee7f61d9ae6774bda30f8b986"
-    },
-    {
-      "path": "README.md",
-      "size": 13454,
-      "sha256": "54f8f4c5725437a9071490759197e623b7af3030dbf9bb17dfabbc6c4e5564a3"
     },
     {
       "path": "release_check.example.toml",
@@ -87,44 +92,9 @@
       "sha256": "7a4ab4741654592a4c0c5b7429c97935e9f4eba7884de800f90e0a44dcc2349b"
     },
     {
-      "path": "tests/conftest.py",
-      "size": 11497,
-      "sha256": "0ff2a3bec03e0ce5166d930a8bf46f5966dcc147b141daab4f977eb93e0f6416"
-    },
-    {
-      "path": "tests/README.md",
-      "size": 9175,
-      "sha256": "a1648d83c5f75997987c8de705a7bca05fda44a9b4a1fc111c7cb5e12786b426"
-    },
-    {
-      "path": "tests/test_checks.py",
-      "size": 31724,
-      "sha256": "dbd93345a0df962f6df5099f6e09695b31fb0007768a97cb1bec2d34294f45c6"
-    },
-    {
-      "path": "tests/test_cleaning.py",
-      "size": 10006,
-      "sha256": "7b1ff1e0788b4b79493ed20c98f013e22889e2bdb2a5cbd24b5f4506b723854f"
-    },
-    {
-      "path": "tests/test_exit_codes.py",
-      "size": 6591,
-      "sha256": "b1c44987368f346bcc37022cdd0822787b080d73782ae388e20cf29fd329840b"
-    },
-    {
-      "path": "tests/test_packaging.py",
-      "size": 18058,
-      "sha256": "9541fb9371fd3d5a82a61f7d596b24019dc7795aead86e26673fab7c74caf4e7"
-    },
-    {
-      "path": "tests/test_scanner.py",
-      "size": 15488,
-      "sha256": "a8b9bf35edf2d7c533e240048088557d1a5fdc838b983eb1f6271c6436b99ffa"
-    },
-    {
-      "path": "tests/test_verify.py",
-      "size": 16513,
-      "sha256": "2de323ff29581b18ba951399ba3685ab3cf709a8b8d4c2f8c3ab788604730153"
+      "path": "tests/test_gui_rules.py",
+      "size": 11843,
+      "sha256": "4c2056509201ebe5b26d0e83b9db29a5a764d3840ecdbb856112527e28484484"
     }
   ]
 }

@@ -28,6 +28,7 @@ Project Packager runs the release checklist for you, produces a clean archive, e
 | `check`   | Universal checks + your per-project rules; exit 0/1                      |
 | `package` | Clean ZIP with embedded SHA-256 manifest + `.sha256` sidecar             |
 | `verify`  | Re-hash every archive member against the manifest; detect corruption     |
+| `gui`     | Visual include/exclude editor and runner (also `--gui`)                  |
 
 **Backward compatible:** `python project_packager.py .` (no subcommand) still packages.
 
@@ -254,7 +255,39 @@ data/raw/
 notes/scratch_*.md
 ```
 
-Trailing `/` marks a directory pattern; patterns containing `/` match against the relative POSIX path (and everything beneath it); plain patterns match file *and* directory names.
+Trailing `/` marks a directory pattern; patterns containing `/` match against the relative POSIX path (and everything beneath it); plain patterns match file *and* directory names. A leading `/` anchors to the project root.
+
+A leading `!` force-includes, with the same power as `--include`: it overrides every exclusion — built-in, strict, or yours — but never a symlink or the archive being written, and force-included files are still secret-scanned (and block release mode like any other). `\!` escapes a literal leading `!`. `--exclude` values on the command line are never reinterpreted this way.
+
+```
+data/raw/
+!data/raw/sample.csv
+!/old_release.zip
+```
+
+---
+
+## `gui` — pick includes and excludes visually
+
+```bash
+python project_packager.py --gui              # current folder
+python project_packager.py gui C:\path\to\proj
+```
+
+Uses `tkinter` from the standard library, so the tool stays dependency-free. (On Windows it's part of the normal Python install; on Debian/Ubuntu it's `sudo apt install python3-tk`.)
+
+- **Tree preview** of the project with each file marked *included*, *excluded*, *force-included*, *possible secret*, *not scannable*, or *symlink (skipped)*, plus the rule or reason. Folders show `N in · M out` and turn amber when something inside needs attention.
+- **Toggle** a file with double-click, or anything (folders too) with Space/Enter. Toggling writes the narrowest rule that does the job — `/src/config.json`, not `config.json` — and toggling back removes that exact rule.
+- **Right-click** for: exclude this, exclude every `*.ext`, exclude every folder with this name, force-include, remove the rule(s) that excluded this, copy path, show in file manager. Excluded folders can be expanded to rescue a single file from inside them.
+- **Rule lists** for exclusions and force-includes; select a rule to highlight what it matches. Undo (Ctrl+Z), Revert, Save (Ctrl+S).
+- **Filter** by All / Included / Excluded / Attention, and find by name.
+- **Package, Dry run, Run checks, Verify, Init** run this same script as a subprocess, so gates and exit codes are identical to the CLI. A successful package is verified automatically.
+
+Safety properties:
+
+- The preview is computed by the same `build_rules` / `scan_project` / `scan_for_secrets` path as `package`. The GUI has no matching logic of its own.
+- Nothing is written until Save. Saving is atomic (temp file + replace) and keeps your comments and line order.
+- If `.packagerignore` exists but can't be read, editing is disabled — saving a blank list over it would silently drop exclusions you meant to keep.
 
 ---
 
@@ -285,6 +318,8 @@ The manifest can also be inspected or verified with standard tools — it's plai
 | 8    | Project file collides with a reserved internal name            |
 | 9    | `release_check.toml` or `.packagerignore` present but unusable |
 | 10   | A source path escaped the project between scanning and writing |
+
+`--gui` exits 1 if given any option other than a project folder, and 4 if tkinter is unavailable.
 
 ## What `--clean` will and won't touch
 
